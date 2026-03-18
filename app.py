@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+from dataclasses import asdict
 import math
 import time
 import json
@@ -662,44 +663,96 @@ st.markdown(
 )
 
 
-@st.cache_data(ttl=15, show_spinner=False)
+def _serialize_model_list(items: List[Any]) -> List[Dict[str, Any]]:
+    return [asdict(item) for item in list(items or [])]
+
+
+def _restore_model_list(payload: List[Dict[str, Any]], model_type: Any) -> List[Any]:
+    restored: List[Any] = []
+    for item in payload or []:
+        if isinstance(item, model_type):
+            restored.append(item)
+        elif isinstance(item, dict):
+            try:
+                restored.append(model_type(**item))
+            except TypeError:
+                continue
+    return restored
+
+
+def _load_candles_payload_cached(exchange_key: str, symbol: str, interval: str, limit: int, timeout: int) -> List[Dict[str, Any]]:
+    try:
+        return _serialize_model_list(fetch_exchange_candles(exchange_key, symbol, interval, limit, timeout=timeout))
+    except Exception:
+        return []
+
+
 def load_candles_cached(exchange_key: str, symbol: str, interval: str, limit: int, timeout: int) -> List[Candle]:
+    return get_local_ttl_result(
+        f"candles::{exchange_key}::{symbol}::{interval}::{int(limit)}::{int(timeout)}",
+        15,
+        lambda: _restore_model_list(_load_candles_payload_cached(exchange_key, symbol, interval, limit, timeout), Candle),
+    )
+
+
+def _load_orderbook_payload_cached(exchange_key: str, symbol: str, limit: int, timeout: int) -> List[Dict[str, Any]]:
     try:
-        return fetch_exchange_candles(exchange_key, symbol, interval, limit, timeout=timeout)
+        return _serialize_model_list(fetch_exchange_orderbook(exchange_key, symbol, limit, timeout=timeout))
     except Exception:
         return []
 
 
-@st.cache_data(ttl=5, show_spinner=False)
 def load_orderbook_cached(exchange_key: str, symbol: str, limit: int, timeout: int) -> List[OrderBookLevel]:
+    return get_local_ttl_result(
+        f"perp-orderbook::{exchange_key}::{symbol}::{int(limit)}::{int(timeout)}",
+        5,
+        lambda: _restore_model_list(_load_orderbook_payload_cached(exchange_key, symbol, limit, timeout), OrderBookLevel),
+    )
+
+
+def _load_oi_backfill_payload_cached(exchange_key: str, symbol: str, interval: str, limit: int, timeout: int) -> List[Dict[str, Any]]:
     try:
-        return fetch_exchange_orderbook(exchange_key, symbol, limit, timeout=timeout)
+        return _serialize_model_list(fetch_exchange_oi_history(exchange_key, symbol, interval, limit, timeout=timeout))
     except Exception:
         return []
 
 
-@st.cache_data(ttl=90, show_spinner=False)
 def load_oi_backfill_cached(exchange_key: str, symbol: str, interval: str, limit: int, timeout: int) -> List[OIPoint]:
+    return get_local_ttl_result(
+        f"oi::{exchange_key}::{symbol}::{interval}::{int(limit)}::{int(timeout)}",
+        90,
+        lambda: _restore_model_list(_load_oi_backfill_payload_cached(exchange_key, symbol, interval, limit, timeout), OIPoint),
+    )
+
+
+def _load_liquidations_payload_cached(exchange_key: str, symbol: str, limit: int, timeout: int) -> List[Dict[str, Any]]:
     try:
-        return fetch_exchange_oi_history(exchange_key, symbol, interval, limit, timeout=timeout)
+        return _serialize_model_list(fetch_exchange_liquidations(exchange_key, symbol, limit, timeout=timeout))
     except Exception:
         return []
 
 
-@st.cache_data(ttl=10, show_spinner=False)
 def load_liquidations_cached(exchange_key: str, symbol: str, limit: int, timeout: int) -> List[LiquidationEvent]:
+    return get_local_ttl_result(
+        f"liq::{exchange_key}::{symbol}::{int(limit)}::{int(timeout)}",
+        10,
+        lambda: _restore_model_list(_load_liquidations_payload_cached(exchange_key, symbol, limit, timeout), LiquidationEvent),
+    )
+
+
+def _load_exchange_trades_payload_cached(exchange_key: str, symbol: str, limit: int, timeout: int) -> List[Dict[str, Any]]:
     try:
-        return fetch_exchange_liquidations(exchange_key, symbol, limit, timeout=timeout)
+        return _serialize_model_list(fetch_exchange_trades(exchange_key, symbol, limit, timeout=timeout))
     except Exception:
         return []
 
 
-@st.cache_data(ttl=5, show_spinner=False)
 def load_exchange_trades_cached(exchange_key: str, symbol: str, limit: int, timeout: int) -> List[TradeEvent]:
-    try:
-        return fetch_exchange_trades(exchange_key, symbol, limit, timeout=timeout)
-    except Exception:
-        return []
+    return get_local_ttl_result(
+        f"perp-trades::{exchange_key}::{symbol}::{int(limit)}::{int(timeout)}",
+        5,
+        lambda: _restore_model_list(_load_exchange_trades_payload_cached(exchange_key, symbol, limit, timeout), TradeEvent),
+    )
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -734,52 +787,94 @@ def load_binance_basis_curve_cached(pair: str, period: str, timeout: int):
         return {}
 
 
-@st.cache_data(ttl=5, show_spinner=False)
+def _load_binance_spot_snapshot_payload_cached(symbol: str, timeout: int) -> Dict[str, Any]:
+    try:
+        return asdict(fetch_binance_spot_snapshot(symbol, timeout=timeout))
+    except Exception as exc:
+        return asdict(SpotSnapshot(exchange="Binance Spot", symbol=symbol, status="error", error=str(exc)))
+
+
 def load_binance_spot_snapshot_cached(symbol: str, timeout: int) -> SpotSnapshot:
+    return get_local_ttl_result(
+        f"binance-spot-snapshot::{symbol}::{int(timeout)}",
+        5,
+        lambda: SpotSnapshot(**_load_binance_spot_snapshot_payload_cached(symbol, timeout)),
+    )
+
+
+def _load_binance_spot_orderbook_payload_cached(symbol: str, limit: int, timeout: int) -> List[Dict[str, Any]]:
     try:
-        return fetch_binance_spot_snapshot(symbol, timeout=timeout)
-    except Exception as exc:
-        return SpotSnapshot(exchange="Binance Spot", symbol=symbol, status="error", error=str(exc))
+        return _serialize_model_list(fetch_binance_spot_orderbook(symbol, limit, timeout=timeout))
+    except Exception:
+        return []
 
 
-@st.cache_data(ttl=5, show_spinner=False)
 def load_binance_spot_orderbook_cached(symbol: str, limit: int, timeout: int) -> List[OrderBookLevel]:
+    return get_local_ttl_result(
+        f"binance-spot-orderbook::{symbol}::{int(limit)}::{int(timeout)}",
+        5,
+        lambda: _restore_model_list(_load_binance_spot_orderbook_payload_cached(symbol, limit, timeout), OrderBookLevel),
+    )
+
+
+def _load_binance_spot_trades_payload_cached(symbol: str, limit: int, timeout: int) -> List[Dict[str, Any]]:
     try:
-        return fetch_binance_spot_orderbook(symbol, limit, timeout=timeout)
+        return _serialize_model_list(fetch_binance_spot_trades(symbol, limit, timeout=timeout))
     except Exception:
         return []
 
 
-@st.cache_data(ttl=5, show_spinner=False)
 def load_binance_spot_trades_cached(symbol: str, limit: int, timeout: int) -> List[TradeEvent]:
-    try:
-        return fetch_binance_spot_trades(symbol, limit, timeout=timeout)
-    except Exception:
-        return []
+    return get_local_ttl_result(
+        f"binance-spot-trades::{symbol}::{int(limit)}::{int(timeout)}",
+        5,
+        lambda: _restore_model_list(_load_binance_spot_trades_payload_cached(symbol, limit, timeout), TradeEvent),
+    )
 
 
-@st.cache_data(ttl=5, show_spinner=False)
-def load_spot_snapshot_cached(exchange_key: str, symbol: str, timeout: int) -> SpotSnapshot:
+def _load_spot_snapshot_payload_cached(exchange_key: str, symbol: str, timeout: int) -> Dict[str, Any]:
     try:
-        return fetch_spot_snapshot(exchange_key, symbol, timeout=timeout)
+        return asdict(fetch_spot_snapshot(exchange_key, symbol, timeout=timeout))
     except Exception as exc:
-        return SpotSnapshot(exchange=f"{EXCHANGE_TITLES.get(exchange_key, exchange_key.title())} Spot", symbol=symbol, status="error", error=str(exc))
+        return asdict(SpotSnapshot(exchange=f"{EXCHANGE_TITLES.get(exchange_key, exchange_key.title())} Spot", symbol=symbol, status="error", error=str(exc)))
 
 
-@st.cache_data(ttl=5, show_spinner=False)
+def load_spot_snapshot_cached(exchange_key: str, symbol: str, timeout: int) -> SpotSnapshot:
+    return get_local_ttl_result(
+        f"spot-snapshot::{exchange_key}::{symbol}::{int(timeout)}",
+        5,
+        lambda: SpotSnapshot(**_load_spot_snapshot_payload_cached(exchange_key, symbol, timeout)),
+    )
+
+
+def _load_spot_orderbook_payload_cached(exchange_key: str, symbol: str, limit: int, timeout: int) -> List[Dict[str, Any]]:
+    try:
+        return _serialize_model_list(fetch_spot_orderbook(exchange_key, symbol, limit, timeout=timeout))
+    except Exception:
+        return []
+
+
 def load_spot_orderbook_cached(exchange_key: str, symbol: str, limit: int, timeout: int) -> List[OrderBookLevel]:
+    return get_local_ttl_result(
+        f"spot-orderbook::{exchange_key}::{symbol}::{int(limit)}::{int(timeout)}",
+        5,
+        lambda: _restore_model_list(_load_spot_orderbook_payload_cached(exchange_key, symbol, limit, timeout), OrderBookLevel),
+    )
+
+
+def _load_spot_trades_payload_cached(exchange_key: str, symbol: str, limit: int, timeout: int) -> List[Dict[str, Any]]:
     try:
-        return fetch_spot_orderbook(exchange_key, symbol, limit, timeout=timeout)
+        return _serialize_model_list(fetch_spot_trades(exchange_key, symbol, limit, timeout=timeout))
     except Exception:
         return []
 
 
-@st.cache_data(ttl=5, show_spinner=False)
 def load_spot_trades_cached(exchange_key: str, symbol: str, limit: int, timeout: int) -> List[TradeEvent]:
-    try:
-        return fetch_spot_trades(exchange_key, symbol, limit, timeout=timeout)
-    except Exception:
-        return []
+    return get_local_ttl_result(
+        f"spot-trades::{exchange_key}::{symbol}::{int(limit)}::{int(timeout)}",
+        5,
+        lambda: _restore_model_list(_load_spot_trades_payload_cached(exchange_key, symbol, limit, timeout), TradeEvent),
+    )
 
 
 @st.cache_data(ttl=12, show_spinner=False)
@@ -815,12 +910,12 @@ def load_hyperliquid_all_mids_cached(timeout: int) -> Dict[str, str]:
         return {}
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def load_exchange_coin_catalog_cached(timeout: int) -> Dict[str, Any]:
     try:
         return fetch_exchange_coin_catalog(timeout=timeout)
     except Exception:
-        return {"coins": [], "availability": {}, "summary": {}}
+        return {"coins": [], "availability": {}, "summary": {}, "status": {}, "errors": {}}
 
 
 def merge_liquidation_event_groups(*groups: List[LiquidationEvent]) -> List[LiquidationEvent]:
@@ -2282,6 +2377,8 @@ def _derived_cache_store() -> Dict[str, Dict[str, Any]]:
 
 _STALE_RESULT_CACHE: Dict[str, Dict[str, Any]] = {}
 _STALE_RESULT_LOCK = threading.Lock()
+_LOCAL_TTL_CACHE: Dict[str, Dict[str, Any]] = {}
+_LOCAL_TTL_CACHE_LOCK = threading.Lock()
 
 
 def _schedule_stale_result_refresh(
@@ -2375,6 +2472,18 @@ def get_cached_derived_result(
         return entry.get("value")
     value = builder()
     cache[cache_key] = {"signature": signature, "created_at": now, "value": value}
+    return value
+
+
+def get_local_ttl_result(cache_key: str, ttl_seconds: int, builder: Callable[[], Any]):
+    now = time.time()
+    with _LOCAL_TTL_CACHE_LOCK:
+        entry = _LOCAL_TTL_CACHE.get(cache_key)
+        if entry and now - float(entry.get("created_at", 0.0)) <= float(ttl_seconds):
+            return entry.get("value")
+    value = builder()
+    with _LOCAL_TTL_CACHE_LOCK:
+        _LOCAL_TTL_CACHE[cache_key] = {"created_at": now, "value": value}
     return value
 
 
@@ -2770,7 +2879,11 @@ def compute_oi_change_pct(points: List[OIPoint], hours_back: int) -> float | Non
 def load_market_overview_row_cached(coin: str, timeout: int, liquidation_sample_limit: int) -> Dict[str, object]:
     coin = coin.upper().strip()
     catalog_payload = load_exchange_coin_catalog_cached(timeout)
-    available_perp_keys, available_spot_keys = resolve_coin_market_availability(coin, catalog_payload.get("availability") or {})
+    available_perp_keys, available_spot_keys = resolve_coin_market_availability(
+        coin,
+        catalog_payload.get("availability") or {},
+        catalog_payload.get("status") or {},
+    )
     symbol_map, spot_symbols = filter_symbol_maps_for_coin(default_symbols(coin), default_spot_symbols(coin), available_perp_keys, available_spot_keys)
     snapshots = fetch_all_snapshots(symbol_map, timeout=timeout)
     snapshot_map = {key: snapshot for key, snapshot in zip(EXCHANGE_ORDER, snapshots)}
@@ -3064,17 +3177,50 @@ def order_coin_options(options: List[str]) -> List[str]:
     return pinned + extras
 
 
-def build_coin_availability_caption(base_coin: str, availability: Dict[str, Dict[str, Dict[str, bool]]]) -> str:
+def build_catalog_summary_text(
+    summary: Dict[str, Dict[str, Any]],
+    catalog_status: Dict[str, Dict[str, str]],
+) -> str:
+    parts: List[str] = []
+    for exchange_key in EXCHANGE_ORDER:
+        exchange_name = EXCHANGE_TITLES[exchange_key]
+        summary_row = summary.get(exchange_key) or {}
+        status_row = catalog_status.get(exchange_key) or {}
+        perp_status = str(status_row.get("perp") or "")
+        spot_status = str(status_row.get("spot") or "")
+        perp_label = "合约目录受限" if perp_status == "error" else f"合约 {int(summary_row.get('perp') or 0)}"
+        if exchange_key == "hyperliquid":
+            spot_label = "现货未接入"
+        else:
+            spot_label = "现货目录受限" if spot_status == "error" else f"现货 {int(summary_row.get('spot') or 0)}"
+        parts.append(f"{exchange_name} {perp_label} / {spot_label}")
+    return " | ".join(parts)
+
+
+def build_coin_availability_caption(
+    base_coin: str,
+    availability: Dict[str, Dict[str, Dict[str, bool]]],
+    catalog_status: Dict[str, Dict[str, str]] | None = None,
+) -> str:
     normalized_coin = str(base_coin or "").strip().upper()
     if not normalized_coin:
         return ""
     availability_row = availability.get(normalized_coin) or {}
+    catalog_status = catalog_status or {}
+    catalog_errors = [
+        EXCHANGE_TITLES[exchange_key]
+        for exchange_key in EXCHANGE_ORDER
+        if "error" in {str((catalog_status.get(exchange_key) or {}).get("perp") or ""), str((catalog_status.get(exchange_key) or {}).get("spot") or "")}
+    ]
     if not availability_row:
+        if catalog_errors:
+            return f"{normalized_coin}: {', '.join(catalog_errors)} 目录受限，已按默认符号继续尝试真实行情，不再直接判成未上架。"
         return f"{normalized_coin}: 目录里还没命中，仍然可以手动输入并用下面的合约映射框继续尝试。"
     parts: List[str] = []
     missing: List[str] = []
     for exchange_key in EXCHANGE_ORDER:
         exchange_row = availability_row.get(exchange_key) or {}
+        status_row = catalog_status.get(exchange_key) or {}
         market_labels: List[str] = []
         if exchange_row.get("perp"):
             market_labels.append("合约")
@@ -3082,6 +3228,8 @@ def build_coin_availability_caption(base_coin: str, availability: Dict[str, Dict
             market_labels.append("现货")
         if market_labels:
             parts.append(f"{EXCHANGE_TITLES[exchange_key]} {'/'.join(market_labels)}")
+        elif "error" in {str(status_row.get("perp") or ""), str(status_row.get("spot") or "")}:
+            parts.append(f"{EXCHANGE_TITLES[exchange_key]} 目录受限(按默认符号继续尝试)")
         else:
             missing.append(EXCHANGE_TITLES[exchange_key])
     caption = " | ".join(parts) if parts else f"{normalized_coin}: 当前目录还没发现可用市场。"
@@ -3093,11 +3241,21 @@ def build_coin_availability_caption(base_coin: str, availability: Dict[str, Dict
 def resolve_coin_market_availability(
     base_coin: str,
     availability: Dict[str, Dict[str, Dict[str, bool]]],
+    catalog_status: Dict[str, Dict[str, str]] | None = None,
 ) -> Tuple[List[str], List[str]]:
     normalized_coin = str(base_coin or "").strip().upper()
     availability_row = availability.get(normalized_coin) or {}
-    perp_keys = [exchange_key for exchange_key in EXCHANGE_ORDER if (availability_row.get(exchange_key) or {}).get("perp")]
-    spot_keys = [exchange_key for exchange_key in SPOT_EXCHANGE_ORDER if (availability_row.get(exchange_key) or {}).get("spot")]
+    catalog_status = catalog_status or {}
+    perp_keys = [
+        exchange_key
+        for exchange_key in EXCHANGE_ORDER
+        if (availability_row.get(exchange_key) or {}).get("perp") or str((catalog_status.get(exchange_key) or {}).get("perp") or "") == "error"
+    ]
+    spot_keys = [
+        exchange_key
+        for exchange_key in SPOT_EXCHANGE_ORDER
+        if (availability_row.get(exchange_key) or {}).get("spot") or str((catalog_status.get(exchange_key) or {}).get("spot") or "") == "error"
+    ]
     return perp_keys, spot_keys
 
 
@@ -3597,6 +3755,7 @@ except (TypeError, ValueError):
     coin_catalog_timeout = 10
 coin_catalog_payload = load_exchange_coin_catalog_cached(coin_catalog_timeout)
 coin_market_availability = coin_catalog_payload.get("availability") or {}
+coin_catalog_status = coin_catalog_payload.get("status") or {}
 coin_catalog_options = order_coin_options(list(coin_catalog_payload.get("coins") or []))
 if not coin_catalog_options:
     coin_catalog_options = order_coin_options(POPULAR_COINS)
@@ -3617,12 +3776,9 @@ custom_coin = st.sidebar.text_input(
 )
 base_coin = custom_coin.strip().upper() if custom_coin.strip() else preset_coin
 st.sidebar.caption("下拉框现在是全交易所币种目录，展开后可以直接键盘搜索；手动输入会覆盖下拉选择。")
-catalog_summary_text = " | ".join(
-    f"{EXCHANGE_TITLES[key]} 合约 {int((coin_catalog_summary.get(key) or {}).get('perp') or 0)} / 现货 {int((coin_catalog_summary.get(key) or {}).get('spot') or 0)}"
-    for key in EXCHANGE_ORDER
-)
+catalog_summary_text = build_catalog_summary_text(coin_catalog_summary, coin_catalog_status)
 st.sidebar.caption("目录覆盖: " + catalog_summary_text)
-st.sidebar.caption(build_coin_availability_caption(base_coin, coin_catalog_payload.get("availability") or {}))
+st.sidebar.caption(build_coin_availability_caption(base_coin, coin_catalog_payload.get("availability") or {}, coin_catalog_status))
 base_defaults = default_symbols(base_coin)
 if st.session_state.get("symbol_base_coin") != base_coin:
     for key in ("bybit", "binance", "okx", "hyperliquid"):
@@ -3901,7 +4057,7 @@ symbol_map = {
     "hyperliquid": hyper_symbol.strip().upper(),
 }
 spot_symbol_map = default_spot_symbols(base_coin)
-available_perp_keys, available_spot_keys = resolve_coin_market_availability(base_coin, coin_market_availability)
+available_perp_keys, available_spot_keys = resolve_coin_market_availability(base_coin, coin_market_availability, coin_catalog_status)
 requested_exchange = selected_exchange
 selected_exchange, selected_exchange_note = resolve_effective_exchange(requested_exchange, available_perp_keys)
 symbol_map, spot_symbol_map = filter_symbol_maps_for_coin(symbol_map, spot_symbol_map, available_perp_keys, available_spot_keys)

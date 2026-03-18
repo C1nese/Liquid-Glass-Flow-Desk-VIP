@@ -180,6 +180,15 @@ def _collect_bybit_instruments(client: "BaseClient", category: str) -> List[Dict
 
 def fetch_exchange_coin_catalog(timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
     availability: Dict[str, Dict[str, Dict[str, bool]]] = {}
+    status: Dict[str, Dict[str, str]] = {
+        exchange_key: {"perp": "unknown", "spot": "unknown"}
+        for exchange_key in EXCHANGE_ORDER
+    }
+    errors: Dict[str, Dict[str, str]] = {
+        exchange_key: {"perp": "", "spot": ""}
+        for exchange_key in EXCHANGE_ORDER
+    }
+    status["hyperliquid"]["spot"] = "unsupported"
 
     def register(exchange_key: str, market: str, coins: List[str]) -> None:
         unique_coins = sorted({_normalize_coin_code(item) for item in coins if _normalize_coin_code(item)})
@@ -206,8 +215,10 @@ def fetch_exchange_coin_catalog(timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any
                 and str(item.get("status") or "").upper() == "TRADING"
             ],
         )
-    except Exception:
-        pass
+        status["binance"]["perp"] = "ok"
+    except Exception as exc:
+        status["binance"]["perp"] = "error"
+        errors["binance"]["perp"] = str(exc)
 
     try:
         binance_spot_payload = BinanceSpotClient(timeout)._request("GET", "/api/v3/exchangeInfo")
@@ -221,8 +232,10 @@ def fetch_exchange_coin_catalog(timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any
                 and str(item.get("status") or "").upper() == "TRADING"
             ],
         )
-    except Exception:
-        pass
+        status["binance"]["spot"] = "ok"
+    except Exception as exc:
+        status["binance"]["spot"] = "error"
+        errors["binance"]["spot"] = str(exc)
 
     try:
         bybit_linear_rows = _collect_bybit_instruments(BybitClient(timeout), "linear")
@@ -236,8 +249,10 @@ def fetch_exchange_coin_catalog(timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any
                 and str(item.get("status") or "").lower() in {"trading", "settling"}
             ],
         )
-    except Exception:
-        pass
+        status["bybit"]["perp"] = "ok"
+    except Exception as exc:
+        status["bybit"]["perp"] = "error"
+        errors["bybit"]["perp"] = str(exc)
 
     try:
         bybit_spot_rows = _collect_bybit_instruments(BybitSpotClient(timeout), "spot")
@@ -251,8 +266,10 @@ def fetch_exchange_coin_catalog(timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any
                 and str(item.get("status") or "").lower() in {"trading", "settling"}
             ],
         )
-    except Exception:
-        pass
+        status["bybit"]["spot"] = "ok"
+    except Exception as exc:
+        status["bybit"]["spot"] = "error"
+        errors["bybit"]["spot"] = str(exc)
 
     try:
         okx_perp_payload = OkxClient(timeout)._request("GET", "/api/v5/public/instruments", params={"instType": "SWAP"})
@@ -266,8 +283,10 @@ def fetch_exchange_coin_catalog(timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any
                 and str(item.get("state") or "").lower() == "live"
             ],
         )
-    except Exception:
-        pass
+        status["okx"]["perp"] = "ok"
+    except Exception as exc:
+        status["okx"]["perp"] = "error"
+        errors["okx"]["perp"] = str(exc)
 
     try:
         okx_spot_payload = OkxSpotClient(timeout)._request("GET", "/api/v5/public/instruments", params={"instType": "SPOT"})
@@ -281,8 +300,10 @@ def fetch_exchange_coin_catalog(timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any
                 and str(item.get("state") or "").lower() == "live"
             ],
         )
-    except Exception:
-        pass
+        status["okx"]["spot"] = "ok"
+    except Exception as exc:
+        status["okx"]["spot"] = "error"
+        errors["okx"]["spot"] = str(exc)
 
     try:
         hyper_meta_payload = HyperliquidClient(timeout)._request("POST", "/info", json={"type": "meta"})
@@ -292,8 +313,10 @@ def fetch_exchange_coin_catalog(timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any
             "perp",
             [item.get("name") for item in universe if isinstance(item, dict)],
         )
-    except Exception:
-        pass
+        status["hyperliquid"]["perp"] = "ok"
+    except Exception as exc:
+        status["hyperliquid"]["perp"] = "error"
+        errors["hyperliquid"]["perp"] = str(exc)
 
     coins = sorted(availability)
     summary = {
@@ -303,7 +326,7 @@ def fetch_exchange_coin_catalog(timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any
         }
         for exchange_key in EXCHANGE_ORDER
     }
-    return {"coins": coins, "availability": availability, "summary": summary}
+    return {"coins": coins, "availability": availability, "summary": summary, "status": status, "errors": errors}
 
 
 def compute_notional(price: Optional[float], size: Optional[float]) -> Optional[float]:
