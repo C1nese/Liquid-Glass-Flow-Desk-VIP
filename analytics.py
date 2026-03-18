@@ -2070,6 +2070,24 @@ def _latest_dataset_timestamp(payload: Dict[str, List[dict]], dataset_key: str) 
     return None if pd.isna(value) else int(value)
 
 
+def _contract_sentiment_resonance_score(
+    ratio_value: float | None,
+    funding_bps: float | None,
+    active_buy_pct: float | None,
+    taker_ratio: float | None,
+) -> float:
+    score = 0.0
+    if ratio_value is not None:
+        score += min(40.0, abs(float(ratio_value) - 1.0) * 260.0)
+    if funding_bps is not None:
+        score += min(20.0, abs(float(funding_bps)) * 6.0)
+    if active_buy_pct is not None:
+        score += min(20.0, abs(float(active_buy_pct) - 50.0) * 0.9)
+    if taker_ratio is not None:
+        score += min(20.0, abs(float(taker_ratio) - 1.0) * 90.0)
+    return max(0.0, min(100.0, score))
+
+
 def _contract_sentiment_label(
     ratio_value: float | None,
     funding_bps: float | None,
@@ -2117,29 +2135,42 @@ def build_contract_sentiment_truth_frame(
             active_buy_pct = float(trade_metrics.get("buy_ratio") or 0.0) * 100.0
 
         ratio_value = None
+        top_position_ratio = None
+        top_account_ratio = None
+        global_account_ratio = None
+        taker_ratio = None
         account_long_pct = None
         account_short_pct = None
         source_label = "OI / Funding / 主动流代理"
         source_confidence = "代理"
+        truth_tier = "代理"
         source_timestamp_ms = snapshot.timestamp_ms
 
         if exchange_key == "binance":
-            ratio_value = _latest_dataset_float(payload, "top_position", "longShortRatio")
+            top_position_ratio = _latest_dataset_float(payload, "top_position", "longShortRatio")
+            top_account_ratio = _latest_dataset_float(payload, "top_account", "longShortRatio")
+            global_account_ratio = _latest_dataset_float(payload, "global_account", "longShortRatio")
+            taker_ratio = _latest_dataset_float(payload, "taker_ratio", "buySellRatio")
+            ratio_value = top_position_ratio or top_account_ratio or global_account_ratio
             account_long_pct = _latest_dataset_float(payload, "global_account", "longAccount")
             account_short_pct = _latest_dataset_float(payload, "global_account", "shortAccount")
-            source_label = "Top Position + Global Account + Taker"
+            source_label = "Top Position + Top Account + Global Account + Taker"
             source_confidence = "高"
+            truth_tier = "真值"
             source_timestamp_ms = (
                 _latest_dataset_timestamp(payload, "top_position")
+                or _latest_dataset_timestamp(payload, "top_account")
                 or _latest_dataset_timestamp(payload, "global_account")
                 or snapshot.timestamp_ms
             )
         elif exchange_key == "bybit":
             ratio_value = _latest_dataset_float(payload, "account_ratio", "longShortRatio")
+            top_account_ratio = ratio_value
             account_long_pct = _latest_dataset_float(payload, "account_ratio", "longAccount")
             account_short_pct = _latest_dataset_float(payload, "account_ratio", "shortAccount")
-            source_label = "Account Ratio"
-            source_confidence = "中"
+            source_label = "Account Ratio + OI + Funding"
+            source_confidence = "中高"
+            truth_tier = "真值"
             source_timestamp_ms = _latest_dataset_timestamp(payload, "account_ratio") or snapshot.timestamp_ms
         elif exchange_key == "okx":
             source_label = "公开多空比未接入，先看 OI / Funding / 主动流"
@@ -2148,6 +2179,8 @@ def build_contract_sentiment_truth_frame(
             source_label = "公开全市场多空比缺失，先看 OI / Funding / 主动流"
             source_confidence = "代理"
 
+        resonance_score = _contract_sentiment_resonance_score(ratio_value, snapshot.funding_bps, active_buy_pct, taker_ratio)
+
         rows.append(
             {
                 "交易所": exchange_name,
@@ -2155,10 +2188,16 @@ def build_contract_sentiment_truth_frame(
                 "未平仓金额": snapshot.open_interest_notional,
                 "资金费率(bps)": snapshot.funding_bps,
                 "合约多空比": ratio_value,
+                "大户持仓多空比": top_position_ratio,
+                "大户账户多空比": top_account_ratio,
+                "全市场账户多空比": global_account_ratio,
                 "账户多头占比(%)": None if account_long_pct is None else account_long_pct * 100.0,
                 "账户空头占比(%)": None if account_short_pct is None else account_short_pct * 100.0,
                 "主动流买占比(%)": active_buy_pct,
+                "主动买卖比": taker_ratio,
+                "共振评分": resonance_score,
                 "情绪标签": _contract_sentiment_label(ratio_value, snapshot.funding_bps, active_buy_pct),
+                "真值层级": truth_tier,
                 "数据口径": source_label,
                 "口径置信度": source_confidence,
                 "时间": source_timestamp_ms,
@@ -2175,10 +2214,16 @@ def build_contract_sentiment_truth_frame(
                 "OI份额(%)",
                 "资金费率(bps)",
                 "合约多空比",
+                "大户持仓多空比",
+                "大户账户多空比",
+                "全市场账户多空比",
                 "账户多头占比(%)",
                 "账户空头占比(%)",
                 "主动流买占比(%)",
+                "主动买卖比",
+                "共振评分",
                 "情绪标签",
+                "真值层级",
                 "数据口径",
                 "口径置信度",
                 "时间",
@@ -2186,7 +2231,7 @@ def build_contract_sentiment_truth_frame(
         )
     total_oi = float(frame["未平仓金额"].fillna(0.0).sum())
     frame["OI份额(%)"] = frame["未平仓金额"].fillna(0.0) / total_oi * 100.0 if total_oi > 0 else 0.0
-    return frame.sort_values(["OI份额(%)", "交易所"], ascending=[False, True], na_position="last").reset_index(drop=True)
+    return frame.sort_values(["共振评分", "OI份额(%)", "交易所"], ascending=[False, False, True], na_position="last").reset_index(drop=True)
 
 
 def build_contract_sentiment_truth_figure(frame: pd.DataFrame) -> go.Figure:
@@ -2258,6 +2303,8 @@ def build_contract_ratio_history_figure(
     figure = go.Figure()
     trace_specs = [
         ("binance", "top_position", "Binance 大户持仓比", "#67d1ff"),
+        ("binance", "top_account", "Binance 大户账户比", "#9cf0c2"),
+        ("binance", "global_account", "Binance 全市场账户比", "#ffbf79"),
         ("bybit", "account_ratio", "Bybit 账户多空比", "#ffd76b"),
     ]
     has_trace = False
@@ -2477,7 +2524,10 @@ def build_contract_sentiment_alert_frame(contract_sentiment_frame: pd.DataFrame)
         ratio_value = pd.to_numeric(row.get("合约多空比"), errors="coerce")
         funding_bps = pd.to_numeric(row.get("资金费率(bps)"), errors="coerce")
         active_buy_pct = pd.to_numeric(row.get("主动流买占比(%)"), errors="coerce")
+        taker_ratio = pd.to_numeric(row.get("主动买卖比"), errors="coerce")
+        resonance_score = pd.to_numeric(row.get("共振评分"), errors="coerce")
         confidence = str(row.get("口径置信度") or "代理")
+        truth_tier = str(row.get("真值层级") or "代理")
         source_label = str(row.get("数据口径") or "")
         row_alert_count = 0
 
@@ -2510,11 +2560,31 @@ def build_contract_sentiment_alert_frame(contract_sentiment_frame: pd.DataFrame)
             elif float(active_buy_pct) <= 38.0:
                 add("中", "主动卖显著占优", f"{exchange} 主动流买占比 {float(active_buy_pct):.1f}%，短线更像主动抛压。")
 
+        if not pd.isna(taker_ratio):
+            if float(taker_ratio) >= 1.18:
+                add("中", "主动买卖比偏多", f"{exchange} 主动买卖比 {float(taker_ratio):.2f}，买方吃单明显占优。")
+            elif float(taker_ratio) <= 0.84:
+                add("中", "主动买卖比偏空", f"{exchange} 主动买卖比 {float(taker_ratio):.2f}，卖方吃单明显占优。")
+
         if not pd.isna(ratio_value) and not pd.isna(funding_bps):
             if float(ratio_value) >= 1.05 and float(funding_bps) >= 0.8:
                 add("高", "多头拥挤共振", f"{exchange} 多空比和 funding 同时偏多，追多拥挤风险抬升。")
             elif float(ratio_value) <= 0.95 and float(funding_bps) <= -0.8:
                 add("高", "空头拥挤共振", f"{exchange} 多空比和 funding 同时偏空，追空拥挤风险抬升。")
+
+        if not pd.isna(resonance_score):
+            if float(resonance_score) >= 78.0:
+                add(
+                    "高",
+                    "情绪共振极值",
+                    f"{exchange} 共振评分 {float(resonance_score):.1f}，{truth_tier}层样本里多空比、Funding 和主动流同时偏斜。",
+                )
+            elif float(resonance_score) >= 58.0 and row_alert_count == 0:
+                add(
+                    "中",
+                    "情绪共振偏强",
+                    f"{exchange} 共振评分 {float(resonance_score):.1f}，当前已出现较明显的单边拥挤迹象。",
+                )
 
         if confidence == "代理" and row_alert_count == 0:
             add("观察", "代理情绪观察", f"{exchange} 当前没有公开多空比真值，先用 OI / Funding / 主动流代理观察。")
@@ -4027,6 +4097,7 @@ def build_spot_flow_reference_frame(
     spot_snapshots: Dict[str, SpotSnapshot],
     spot_orderbooks: Dict[str, List[OrderBookLevel]],
     spot_trades_by_exchange: Dict[str, List[TradeEvent]],
+    quality_history_by_exchange: Dict[str, List[OrderBookQualityPoint]] | None,
     exchange_title_map: Dict[str, str],
     *,
     exchange_keys: List[str] | None = None,
@@ -4043,6 +4114,25 @@ def build_spot_flow_reference_frame(
         orderbook = spot_orderbooks.get(exchange_key, [])
         book_summary = summarize_orderbook(orderbook, snapshot.last_price)
         impact_summary = _impact_cost_summary(orderbook, snapshot.last_price)
+        recent_quality = (quality_history_by_exchange or {}).get(exchange_key, [])[-6:]
+        first_bid = next((point.best_bid for point in recent_quality if point.best_bid is not None), None)
+        first_ask = next((point.best_ask for point in recent_quality if point.best_ask is not None), None)
+        last_bid = next((point.best_bid for point in reversed(recent_quality) if point.best_bid is not None), None)
+        last_ask = next((point.best_ask for point in reversed(recent_quality) if point.best_ask is not None), None)
+        quote_drift_bps = None
+        quote_range_bps = None
+        if snapshot.last_price not in (None, 0):
+            mid_points = [
+                (float(point.best_bid) + float(point.best_ask)) * 0.5
+                for point in recent_quality
+                if point.best_bid is not None and point.best_ask is not None
+            ]
+            if first_bid is not None and first_ask is not None and last_bid is not None and last_ask is not None:
+                first_mid = (float(first_bid) + float(first_ask)) * 0.5
+                last_mid = (float(last_bid) + float(last_ask)) * 0.5
+                quote_drift_bps = (last_mid - first_mid) / max(float(snapshot.last_price or 0.0), 1e-9) * 10000.0
+            if mid_points:
+                quote_range_bps = (max(mid_points) - min(mid_points)) / max(float(snapshot.last_price or 0.0), 1e-9) * 10000.0
         rows.append(
             {
                 "交易所": exchange_name,
@@ -4053,6 +4143,9 @@ def build_spot_flow_reference_frame(
                 "主动状态": trade_metrics.get("regime") or "样本不足",
                 "价差(bps)": snapshot.spread_bps if snapshot.spread_bps is not None else book_summary.get("spread_bps"),
                 "盘口失衡(%)": book_summary.get("imbalance_pct"),
+                "可见深度": (book_summary.get("bid_notional") or 0.0) + (book_summary.get("ask_notional") or 0.0),
+                "报价漂移(bps)": quote_drift_bps,
+                "报价波动(bps)": quote_range_bps,
                 "50k冲击(bps)": impact_summary.get("50k冲击(bps)"),
                 "250k冲击(bps)": impact_summary.get("250k冲击(bps)"),
                 "50k填充率(%)": impact_summary.get("50k填充率(%)"),
@@ -4072,6 +4165,9 @@ def build_spot_flow_reference_frame(
                 "主动状态",
                 "价差(bps)",
                 "盘口失衡(%)",
+                "可见深度",
+                "报价漂移(bps)",
+                "报价波动(bps)",
                 "50k冲击(bps)",
                 "250k冲击(bps)",
                 "50k填充率(%)",
@@ -4149,6 +4245,16 @@ def build_execution_quality_frame(
         recent_history = quality_history_by_exchange.get(exchange_key, [])[-6:]
         near_added = sum(float(point.near_added_notional or 0.0) for point in recent_history)
         near_canceled = sum(float(point.near_canceled_notional or 0.0) for point in recent_history)
+        quote_midpoints = [
+            (float(point.best_bid) + float(point.best_ask)) * 0.5
+            for point in recent_history
+            if point.best_bid is not None and point.best_ask is not None
+        ]
+        quote_drift_bps = None
+        quote_range_bps = None
+        if quote_midpoints and reference_price not in (None, 0):
+            quote_drift_bps = (quote_midpoints[-1] - quote_midpoints[0]) / max(float(reference_price or 0.0), 1e-9) * 10000.0
+            quote_range_bps = (max(quote_midpoints) - min(quote_midpoints)) / max(float(reference_price or 0.0), 1e-9) * 10000.0
         rows.append(
             {
                 "交易所": exchange_title_map.get(exchange_key, exchange_key.title()),
@@ -4161,9 +4267,14 @@ def build_execution_quality_frame(
                 "250k冲击(bps)": impact_summary.get("250k冲击(bps)"),
                 "50k填充率(%)": impact_summary.get("50k填充率(%)"),
                 "250k填充率(%)": impact_summary.get("250k填充率(%)"),
+                "近价新增额": near_added,
+                "近价撤单额": near_canceled,
+                "近价净变化": near_added - near_canceled if recent_history else None,
                 "近价撤补比": near_canceled / max(near_added, 1.0) if recent_history else None,
                 "补单次数": sum(int(point.refill_events or 0) for point in recent_history),
                 "假挂单次数": sum(int(point.spoof_events or 0) for point in recent_history),
+                "报价漂移(bps)": quote_drift_bps,
+                "报价波动(bps)": quote_range_bps,
                 "时间": getattr(snapshot, "timestamp_ms", None),
             }
         )
@@ -4181,9 +4292,14 @@ def build_execution_quality_frame(
                 "250k冲击(bps)",
                 "50k填充率(%)",
                 "250k填充率(%)",
+                "近价新增额",
+                "近价撤单额",
+                "近价净变化",
                 "近价撤补比",
                 "补单次数",
                 "假挂单次数",
+                "报价漂移(bps)",
+                "报价波动(bps)",
                 "时间",
             ]
         )
@@ -4402,6 +4518,39 @@ def _extract_funding_band_bps(snapshot: ExchangeSnapshot) -> float | None:
     return None
 
 
+def _extract_basis_rate_pct(snapshot: ExchangeSnapshot, basis_pct: float | None) -> float | None:
+    raw = snapshot.raw or {}
+    exchange_name = str(snapshot.exchange or "").lower()
+    if "bybit" in exchange_name and isinstance(raw, dict):
+        bybit_basis_rate = _coerce_float(raw.get("basisRate"))
+        if bybit_basis_rate is not None:
+            return bybit_basis_rate * 100.0
+    return basis_pct
+
+
+def _classify_carry_state(
+    funding_bps: float | None,
+    premium_pct: float | None,
+    basis_pct: float | None,
+    next_funding_bps: float | None,
+) -> str:
+    if funding_bps is not None and basis_pct is not None:
+        if funding_bps >= 0.8 and basis_pct >= 0.05:
+            return "正 Carry / 空永续多现货"
+        if funding_bps <= -0.8 and basis_pct <= -0.05:
+            return "反向 Carry / 多永续空现货"
+    if funding_bps is not None and premium_pct is not None and funding_bps * premium_pct < 0:
+        return "Funding / Premium 背离"
+    if next_funding_bps is not None and funding_bps is not None and next_funding_bps * funding_bps < 0:
+        return "费率方向切换"
+    if basis_pct is not None:
+        if basis_pct >= 0.08:
+            return "基差偏正 / 观察空永续"
+        if basis_pct <= -0.08:
+            return "基差偏负 / 观察多永续"
+    return "中性 / 等待扩张"
+
+
 def _classify_funding_regime(funding_bps: float | None, premium_pct: float | None, basis_pct: float | None) -> str:
     if funding_bps is not None and premium_pct is not None:
         if funding_bps >= 0.8 and premium_pct >= 0.03:
@@ -4436,24 +4585,33 @@ def build_funding_regime_frame(
             basis_pct = (snapshot.last_price - spot_snapshot.last_price) / spot_snapshot.last_price * 100.0
         funding_bps = snapshot.funding_bps
         premium_pct = snapshot.premium_pct
+        next_funding_bps = _extract_next_funding_rate_bps(snapshot)
+        basis_rate_pct = _extract_basis_rate_pct(snapshot, basis_pct)
+        next_funding_time_ms = _extract_next_funding_time_ms(snapshot)
+        minutes_to_funding = None
+        if next_funding_time_ms is not None and snapshot.timestamp_ms is not None:
+            minutes_to_funding = max(0.0, (float(next_funding_time_ms) - float(snapshot.timestamp_ms)) / 60000.0)
         rows.append(
             {
                 "交易所": exchange_title_map.get(exchange_key, exchange_key.title()),
                 "价格": snapshot.last_price,
                 "Premium(%)": premium_pct,
                 "Basis(%)": basis_pct,
+                "基差率(%)": basis_rate_pct,
                 "Funding(bps)": funding_bps,
-                "下一次Funding(bps)": _extract_next_funding_rate_bps(snapshot),
+                "下一次Funding(bps)": next_funding_bps,
                 "Funding带宽(bps)": _extract_funding_band_bps(snapshot),
                 "状态": _classify_funding_regime(funding_bps, premium_pct, basis_pct),
+                "Carry状态": _classify_carry_state(funding_bps, premium_pct, basis_pct, next_funding_bps),
                 "时间": snapshot.timestamp_ms,
-                "下次Funding时间": _extract_next_funding_time_ms(snapshot),
+                "下次Funding时间": next_funding_time_ms,
+                "距下次Funding(min)": minutes_to_funding,
             }
         )
     frame = pd.DataFrame(rows)
     if frame.empty:
         return pd.DataFrame(
-            columns=["交易所", "价格", "Premium(%)", "Basis(%)", "Funding(bps)", "下一次Funding(bps)", "Funding带宽(bps)", "状态", "时间", "下次Funding时间"]
+            columns=["交易所", "价格", "Premium(%)", "Basis(%)", "基差率(%)", "Funding(bps)", "下一次Funding(bps)", "Funding带宽(bps)", "状态", "Carry状态", "时间", "下次Funding时间", "距下次Funding(min)"]
         )
     frame["_priority"] = (
         pd.to_numeric(frame["Funding(bps)"], errors="coerce").abs().fillna(0.0)
@@ -4512,6 +4670,18 @@ def build_liquidation_truth_inference_frame(
     now_ms: int | None = None,
     window_minutes: int = 60,
 ) -> pd.DataFrame:
+    def liquidation_coverage_profile(exchange_name: str) -> Dict[str, str]:
+        normalized = str(exchange_name or "").lower()
+        if "bybit" in normalized:
+            return {"coverage": "高", "tape": "WS全量", "note": "allLiquidation / 500ms"}
+        if "binance" in normalized:
+            return {"coverage": "中", "tape": "WS抽样", "note": "每symbol 1000ms 最新强平"}
+        if "okx" in normalized:
+            return {"coverage": "中低", "tape": "WS抽样", "note": "每合约每秒最多一笔"}
+        if "hyperliquid" in normalized:
+            return {"coverage": "低", "tape": "公开真值缺失", "note": "当前更适合地址/热力推断"}
+        return {"coverage": "未知", "tape": "未知", "note": "-"}
+
     rows: List[Dict[str, Any]] = []
     inferred_heatmap_frame = inferred_heatmap_frame if not inferred_heatmap_frame.empty else pd.DataFrame(columns=["交易所", "净名义金额", "总名义金额"])
     all_exchanges = sorted(set(events_by_exchange) | set(inferred_heatmap_frame.get("交易所", pd.Series(dtype=str)).astype(str).tolist()))
@@ -4523,6 +4693,9 @@ def build_liquidation_truth_inference_frame(
         negative_bands = int((pd.to_numeric(exchange_frame.get("净名义金额"), errors="coerce") < 0).sum()) if not exchange_frame.empty else 0
         inferred_bias = "空头清算" if positive_bands > negative_bands else "多头清算" if negative_bands > positive_bands else "均衡"
         count_value = int(truth_metrics.get("count") or 0)
+        coverage_profile = liquidation_coverage_profile(exchange_name)
+        coverage_value = str(coverage_profile.get("coverage") or "未知")
+        confidence_value = "高" if count_value >= 4 and coverage_value == "高" else "中" if count_value >= 1 and coverage_value in {"高", "中", "中低"} else "低"
         rows.append(
             {
                 "交易所": exchange_name,
@@ -4532,13 +4705,176 @@ def build_liquidation_truth_inference_frame(
                 "推断热力额": inferred_total,
                 "推断价带数": len(exchange_frame),
                 "推断主导": inferred_bias,
-                "真值置信度": "高" if count_value >= 4 else "中" if count_value >= 1 else "低",
+                "覆盖等级": coverage_value,
+                "Tape口径": coverage_profile.get("tape"),
+                "采样说明": coverage_profile.get("note"),
+                "真值置信度": confidence_value,
             }
         )
     frame = pd.DataFrame(rows)
     if frame.empty:
-        return pd.DataFrame(columns=["交易所", "真实清算额", "真实事件数", "真实主导", "推断热力额", "推断价带数", "推断主导", "真值置信度"])
+        return pd.DataFrame(columns=["交易所", "真实清算额", "真实事件数", "真实主导", "推断热力额", "推断价带数", "推断主导", "覆盖等级", "Tape口径", "采样说明", "真值置信度"])
     return frame.sort_values(["真实清算额", "推断热力额"], ascending=[False, False], na_position="last").reset_index(drop=True)
+
+
+def build_hyperliquid_spot_perp_context_frame(
+    spot_meta_payload: Dict[str, Any],
+    perp_snapshot: ExchangeSnapshot | None,
+    *,
+    selected_coin: str,
+    address_bundle: Dict[str, Any] | None = None,
+    oi_cap_payload: Dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    selected_coin = str(selected_coin or "").strip().upper()
+    meta = spot_meta_payload.get("meta") or {}
+    contexts = spot_meta_payload.get("contexts") or []
+    tokens = (meta.get("tokens") or []) if isinstance(meta, dict) else []
+    universe = (meta.get("universe") or []) if isinstance(meta, dict) else []
+    token_map = {
+        int(item.get("index")): item
+        for item in tokens if isinstance(item, dict) and item.get("index") is not None
+    }
+    spot_balance = None
+    spot_entry_ntl = None
+    if isinstance(address_bundle, dict):
+        for balance_row in (address_bundle.get("spot_state") or {}).get("balances", []) or []:
+            if str(balance_row.get("coin") or "").upper() == selected_coin:
+                spot_balance = _coerce_float(balance_row.get("total"))
+                spot_entry_ntl = _coerce_float(balance_row.get("entryNtl"))
+                break
+    perp_position_value = None
+    if isinstance(address_bundle, dict):
+        for position in address_bundle.get("positions") or []:
+            if str(position.get("coin") or "").upper() == selected_coin:
+                perp_position_value = _coerce_float(position.get("position_value"))
+                break
+
+    oi_cap = None
+    total_oi_cap = None
+    if isinstance(oi_cap_payload, dict):
+        total_oi_cap = _coerce_float(oi_cap_payload.get("totalOiCap"))
+        coin_cap_items = oi_cap_payload.get("coinToOiCap") or []
+        for item in coin_cap_items if isinstance(coin_cap_items, list) else []:
+            if isinstance(item, (list, tuple)) and len(item) >= 2 and str(item[0]).upper() == selected_coin:
+                oi_cap = _coerce_float(item[1])
+                break
+
+    rows: List[Dict[str, Any]] = []
+    if perp_snapshot is not None and perp_snapshot.status == "ok":
+        current_oi = _coerce_float(perp_snapshot.open_interest)
+        oi_cap_util_pct = None
+        if current_oi is not None and oi_cap not in (None, 0):
+            oi_cap_util_pct = current_oi / max(float(oi_cap or 0.0), 1e-9) * 100.0
+        rows.append(
+            {
+                "市场": "合约",
+                "标的": selected_coin,
+                "价格": perp_snapshot.last_price,
+                "24h成交额": perp_snapshot.volume_24h_notional,
+                "Funding(bps)": perp_snapshot.funding_bps,
+                "Premium(%)": perp_snapshot.premium_pct,
+                "未平仓金额": perp_snapshot.open_interest_notional,
+                "地址余额": None,
+                "地址成本": None,
+                "地址持仓值": perp_position_value,
+                "OI上限占用(%)": oi_cap_util_pct,
+                "OI上限": oi_cap,
+                "全局OI上限": total_oi_cap,
+                "时间": perp_snapshot.timestamp_ms,
+            }
+        )
+
+    for index, pair in enumerate(universe if isinstance(universe, list) else []):
+        if not isinstance(pair, dict):
+            continue
+        token_ids = pair.get("tokens") or []
+        if not isinstance(token_ids, list) or len(token_ids) < 2:
+            continue
+        base_token = token_map.get(int(token_ids[0]), {})
+        quote_token = token_map.get(int(token_ids[1]), {})
+        base_name = str(base_token.get("name") or "").upper()
+        quote_name = str(quote_token.get("name") or "").upper()
+        if base_name != selected_coin:
+            continue
+        context = contexts[index] if index < len(contexts) and isinstance(contexts[index], dict) else {}
+        spot_price = _coerce_float(context.get("midPx")) or _coerce_float(context.get("markPx"))
+        balance_value = spot_balance * spot_price if spot_balance is not None and spot_price is not None else None
+        rows.append(
+            {
+                "市场": "现货",
+                "标的": str(pair.get("name") or f"{base_name}/{quote_name}"),
+                "价格": spot_price,
+                "24h成交额": _coerce_float(context.get("dayNtlVlm")),
+                "Funding(bps)": None,
+                "Premium(%)": None,
+                "未平仓金额": None,
+                "地址余额": spot_balance,
+                "地址成本": spot_entry_ntl,
+                "地址持仓值": balance_value,
+                "OI上限占用(%)": None,
+                "OI上限": None,
+                "全局OI上限": None,
+                "时间": None,
+            }
+        )
+
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return pd.DataFrame(
+            columns=["市场", "标的", "价格", "24h成交额", "Funding(bps)", "Premium(%)", "未平仓金额", "地址余额", "地址成本", "地址持仓值", "OI上限占用(%)", "OI上限", "全局OI上限", "时间"]
+        )
+    market_order = {"合约": 0, "现货": 1}
+    frame["_priority"] = frame["市场"].map(market_order).fillna(9)
+    return frame.sort_values(["_priority", "24h成交额", "标的"], ascending=[True, False, True], na_position="last").drop(columns="_priority").reset_index(drop=True)
+
+
+def build_hyperliquid_spot_perp_context_figure(frame: pd.DataFrame) -> go.Figure:
+    figure = make_subplots(specs=[[{"secondary_y": True}]])
+    if frame.empty:
+        figure.add_annotation(text="等待 Hyperliquid spot / perp 一体样本", showarrow=False, x=0.5, y=0.5, xref="paper", yref="paper")
+        figure.update_layout(height=320, margin=dict(l=12, r=12, t=24, b=12))
+        return figure
+    working = frame.copy()
+    working["24h成交额"] = pd.to_numeric(working["24h成交额"], errors="coerce")
+    working["价格"] = pd.to_numeric(working["价格"], errors="coerce")
+    color_map = {"合约": "rgba(255, 148, 112, 0.78)", "现货": "rgba(103, 209, 255, 0.78)"}
+    figure.add_trace(
+        go.Bar(
+            x=working["标的"],
+            y=working["24h成交额"],
+            marker_color=[color_map.get(str(value), "rgba(255,255,255,0.45)") for value in working["市场"]],
+            text=working["市场"],
+            textposition="outside",
+            name="24h成交额",
+            hovertemplate="%{x}<br>%{text}<br>24h成交额 %{y:,.0f}<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=working["标的"],
+            y=working["价格"],
+            mode="lines+markers",
+            line=dict(color="#f7fbff", width=2.1),
+            marker=dict(size=8, color="#f7fbff"),
+            name="价格",
+            hovertemplate="%{x}<br>价格 %{y:,.4f}<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+    figure.update_layout(
+        height=340,
+        margin=dict(l=12, r=12, t=58, b=12),
+        paper_bgcolor="rgba(14, 22, 35, 0.56)",
+        plot_bgcolor="rgba(255, 255, 255, 0.045)",
+        font=dict(color="#f6f9ff", family="SF Pro Display, Segoe UI, sans-serif"),
+        title=dict(text="Hyperliquid Spot / Perp Unified Context", x=0.03, y=0.98, xanchor="left", font=dict(size=18, color="#f7fbff")),
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1.0),
+    )
+    figure.update_xaxes(showgrid=False)
+    figure.update_yaxes(showgrid=True, gridcolor="rgba(255, 255, 255, 0.08)", title="24h成交额", secondary_y=False)
+    figure.update_yaxes(showgrid=False, title="价格", secondary_y=True)
+    return figure
 
 
 def build_liquidation_truth_inference_figure(frame: pd.DataFrame) -> go.Figure:

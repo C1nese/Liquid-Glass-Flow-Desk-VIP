@@ -24,7 +24,7 @@
   "alert_cooldown_minutes": 15,
   "browser_min_level": "\u5f31",
   "telegram_min_level": "\u5f3a",
-  "active_view": "\u9996\u9875\u603b\u89c8",
+  "active_view": "\u4ea4\u6613\u53f0\u6df1\u5ea6\u9875",
   "lab_mode": "\u603b\u89c8",
   "exchange_scope_mode": "\u5168\u90e8\u4ea4\u6613\u6240",
   "liquidation_archive_window": "\u6700\u8fd1 4 \u5c0f\u65f6",

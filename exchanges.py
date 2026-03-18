@@ -1382,6 +1382,32 @@ class HyperliquidClient(BaseClient):
         payload = self._request("POST", "/info", json=body)
         return payload if isinstance(payload, dict) else {}
 
+    def fetch_spot_meta_and_asset_contexts(self) -> Dict[str, Any]:
+        payload = self._request("POST", "/info", json={"type": "spotMetaAndAssetCtxs"})
+        if isinstance(payload, list) and len(payload) == 2:
+            meta = payload[0] if isinstance(payload[0], dict) else {}
+            contexts = payload[1] if isinstance(payload[1], list) else []
+            return {"meta": meta, "contexts": contexts}
+        return {"meta": {}, "contexts": []}
+
+    def fetch_spot_clearinghouse_state(self, address: str) -> Dict[str, Any]:
+        normalized_address = normalize_onchain_address(address)
+        if not is_valid_onchain_address(normalized_address):
+            raise ValueError("invalid Hyperliquid address")
+        payload = self._request(
+            "POST",
+            "/info",
+            json={"type": "spotClearinghouseState", "user": normalized_address},
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    def fetch_perps_at_open_interest_cap(self, dex: Optional[str] = None) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"type": "perpsAtOpenInterestCap"}
+        if dex:
+            body["dex"] = str(dex)
+        payload = self._request("POST", "/info", json=body)
+        return payload if isinstance(payload, dict) else {}
+
 
 def _parse_hyperliquid_fill(item: dict) -> Dict[str, Any]:
     fill = item.get("fill") if isinstance(item.get("fill"), dict) else item
@@ -1483,6 +1509,7 @@ def fetch_hyperliquid_address_mode(
             "fills": [],
             "funding": [],
             "active_asset": {},
+            "spot_state": {},
         }
 
     client = HyperliquidClient(timeout=timeout)
@@ -1502,6 +1529,7 @@ def fetch_hyperliquid_address_mode(
             "fills": [],
             "funding": [],
             "active_asset": {},
+            "spot_state": {},
         }
 
     raw_positions = state.get("assetPositions") or []
@@ -1538,6 +1566,12 @@ def fetch_hyperliquid_address_mode(
             active_asset = client.fetch_active_asset_data(normalized_address, selected_coin)
         except Exception as exc:
             errors.append(f"activeAssetData: {exc}")
+
+    spot_state: Dict[str, Any] = {}
+    try:
+        spot_state = client.fetch_spot_clearinghouse_state(normalized_address)
+    except Exception as exc:
+        errors.append(f"spotClearinghouseState: {exc}")
 
     role_payload: Dict[str, Any] = {}
     try:
@@ -1584,6 +1618,7 @@ def fetch_hyperliquid_address_mode(
         "fills": fills[:80],
         "funding": funding_records[:80],
         "active_asset": active_asset,
+        "spot_state": spot_state,
         "role": role_text or None,
         "role_payload": role_payload,
         "portfolio": portfolio,
@@ -1603,6 +1638,16 @@ def fetch_hyperliquid_all_mids(timeout: int = DEFAULT_TIMEOUT) -> Dict[str, str]
     client = HyperliquidClient(timeout=timeout)
     payload = client._request("POST", "/info", json={"type": "allMids"})
     return payload if isinstance(payload, dict) else {}
+
+
+def fetch_hyperliquid_spot_meta_and_asset_contexts(timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
+    client = HyperliquidClient(timeout=timeout)
+    return client.fetch_spot_meta_and_asset_contexts()
+
+
+def fetch_hyperliquid_perps_at_open_interest_cap(timeout: int = DEFAULT_TIMEOUT, dex: Optional[str] = None) -> Dict[str, Any]:
+    client = HyperliquidClient(timeout=timeout)
+    return client.fetch_perps_at_open_interest_cap(dex=dex)
 
 
 def fetch_bybit_insurance_pool(coin: str, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:

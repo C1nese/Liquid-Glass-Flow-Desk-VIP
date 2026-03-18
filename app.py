@@ -51,6 +51,8 @@ from analytics import (
     build_heatmap_figure,
     build_hyperliquid_predicted_funding_figure,
     build_hyperliquid_predicted_funding_frame,
+    build_hyperliquid_spot_perp_context_figure,
+    build_hyperliquid_spot_perp_context_frame,
     build_alert_timeline_figure,
     build_large_trade_figure,
     build_large_trade_frame,
@@ -131,7 +133,9 @@ from exchanges import (
     fetch_exchange_trades,
     fetch_hyperliquid_address_mode,
     fetch_hyperliquid_all_mids,
+    fetch_hyperliquid_perps_at_open_interest_cap,
     fetch_hyperliquid_predicted_fundings,
+    fetch_hyperliquid_spot_meta_and_asset_contexts,
     fetch_spot_orderbook,
     fetch_spot_snapshot,
     fetch_spot_trades,
@@ -192,6 +196,7 @@ ALERT_LEVEL_OPTIONS = ["弱", "中", "强"]
 DEFAULT_CROSS_COIN_POOL = ["BTC", "ETH", "SOL"]
 TOP_ORDERBOOK_SCOPE_OPTIONS = ["当前交易所", "四所聚合"]
 TOP_ORDERBOOK_MARKET_OPTIONS = ["合约", "现货", "合并"]
+HEADLINE_KIND_LABELS = {"oi": "OI", "liquidation": "爆仓", "trade": "异动", "large": "大单", "alert": "告警"}
 
 
 st.set_page_config(page_title="多交易所流动性终端", layout="wide")
@@ -408,8 +413,8 @@ st.markdown(
     .headline-marquee-chip {
         display: inline-flex;
         align-items: center;
-        gap: 0.48rem;
-        padding: 0.48rem 0.88rem;
+        gap: 0.62rem;
+        padding: 0.42rem 0.54rem 0.42rem 0.46rem;
         border-radius: 999px;
         background: rgba(10, 19, 31, 0.4);
         border: 1px solid rgba(255, 255, 255, 0.14);
@@ -418,14 +423,63 @@ st.markdown(
         line-height: 1.25;
         box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
     }
-    .headline-marquee-chip::before {
-        content: "";
-        width: 0.45rem;
-        height: 0.45rem;
-        border-radius: 50%;
-        background: linear-gradient(180deg, #9fe5ff, #ffbf8f);
-        box-shadow: 0 0 16px rgba(159, 229, 255, 0.48);
-        flex: 0 0 auto;
+    .headline-marquee-tag,
+    .headline-marquee-text {
+        text-decoration: none !important;
+    }
+    .headline-marquee-tag {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 3.2rem;
+        padding: 0.34rem 0.72rem;
+        border-radius: 999px;
+        font-size: 0.75rem;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        border: 1px solid transparent;
+        white-space: nowrap;
+    }
+    .headline-marquee-text {
+        color: #eff5ff !important;
+        white-space: nowrap;
+        padding-right: 0.24rem;
+    }
+    .headline-tag-oi {
+        background: rgba(112, 196, 255, 0.18);
+        border-color: rgba(112, 196, 255, 0.34);
+        color: #dff3ff !important;
+    }
+    .headline-tag-liquidation {
+        background: rgba(255, 126, 111, 0.18);
+        border-color: rgba(255, 126, 111, 0.34);
+        color: #ffe6df !important;
+    }
+    .headline-tag-trade {
+        background: rgba(255, 198, 120, 0.18);
+        border-color: rgba(255, 198, 120, 0.34);
+        color: #fff0cf !important;
+    }
+    .headline-tag-large {
+        background: rgba(120, 233, 188, 0.18);
+        border-color: rgba(120, 233, 188, 0.34);
+        color: #e3fff4 !important;
+    }
+    .headline-tag-alert {
+        background: rgba(198, 159, 255, 0.18);
+        border-color: rgba(198, 159, 255, 0.34);
+        color: #f0e6ff !important;
+    }
+    .headline-marquee-tag:hover,
+    .headline-marquee-text:hover {
+        filter: brightness(1.06);
+    }
+    .section-anchor {
+        position: relative;
+        top: -82px;
+        visibility: hidden;
+        height: 0;
     }
     @keyframes headline-marquee-scroll {
         from {
@@ -979,6 +1033,7 @@ def load_hyperliquid_address_mode_cached(address: str, coin: str, lookback_hours
             "fills": [],
             "funding": [],
             "active_asset": {},
+            "spot_state": {},
         }
 
 
@@ -994,6 +1049,22 @@ def load_hyperliquid_predicted_fundings_cached(timeout: int) -> List[list]:
 def load_hyperliquid_all_mids_cached(timeout: int) -> Dict[str, str]:
     try:
         return fetch_hyperliquid_all_mids(timeout=timeout)
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def load_hyperliquid_spot_meta_and_asset_contexts_cached(timeout: int) -> Dict[str, Any]:
+    try:
+        return fetch_hyperliquid_spot_meta_and_asset_contexts(timeout=timeout)
+    except Exception:
+        return {"meta": {}, "contexts": []}
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def load_hyperliquid_perps_at_oi_cap_cached(timeout: int) -> Dict[str, Any]:
+    try:
+        return fetch_hyperliquid_perps_at_open_interest_cap(timeout=timeout)
     except Exception:
         return {}
 
@@ -1280,6 +1351,7 @@ def merge_hyperliquid_address_bundle(base_bundle: Dict[str, Any], live_bundle: D
         "withdrawable",
         "total_notional_position",
         "active_asset",
+        "spot_state",
         "raw_state",
         "role",
         "portfolio",
@@ -2341,6 +2413,52 @@ def service_profile(mode: str) -> Dict[str, int]:
     return dict(PERFORMANCE_PROFILES.get(mode, PERFORMANCE_PROFILES["标准"]))
 
 
+def build_refresh_profile(
+    base_refresh_seconds: int,
+    *,
+    active_view: str,
+    overview_mode: str | None = None,
+    lab_mode: str | None = None,
+) -> Dict[str, int]:
+    base_refresh = max(1, int(base_refresh_seconds))
+    profile = {
+        "fast_ttl": max(2, base_refresh),
+        "balanced_ttl": max(4, base_refresh),
+        "heavy_ttl": max(12, base_refresh * 3),
+        "stale_ttl": max(120, base_refresh * 30),
+        "prefetch_age": max(60, base_refresh * 15),
+    }
+    if active_view == "首页总览" and overview_mode == "完整":
+        profile.update(
+            {
+                "balanced_ttl": max(6, base_refresh * 2),
+                "heavy_ttl": max(16, base_refresh * 4),
+                "stale_ttl": max(150, base_refresh * 36),
+                "prefetch_age": max(75, base_refresh * 18),
+            }
+        )
+    elif active_view == "增强实验室":
+        profile.update(
+            {
+                "balanced_ttl": max(8, base_refresh * 2),
+                "heavy_ttl": max(20, base_refresh * 5),
+                "stale_ttl": max(180, base_refresh * 45),
+                "prefetch_age": max(90, base_refresh * 20),
+            }
+        )
+        if lab_mode == "通知与持久化":
+            profile["heavy_ttl"] = max(profile["heavy_ttl"], 24)
+    elif active_view in {"交易台深度页", "盘口中心"}:
+        profile.update(
+            {
+                "balanced_ttl": max(4, base_refresh),
+                "heavy_ttl": max(10, base_refresh * 2),
+                "prefetch_age": max(45, base_refresh * 12),
+            }
+        )
+    return profile
+
+
 def _latency_ms(timestamp_ms: int | None) -> int | None:
     if timestamp_ms is None:
         return None
@@ -2467,6 +2585,47 @@ _STALE_RESULT_CACHE: Dict[str, Dict[str, Any]] = {}
 _STALE_RESULT_LOCK = threading.Lock()
 _LOCAL_TTL_CACHE: Dict[str, Dict[str, Any]] = {}
 _LOCAL_TTL_CACHE_LOCK = threading.Lock()
+_HISTORY_WRITE_PENDING: Dict[str, Callable[[], None]] = {}
+_HISTORY_WRITE_LOCK = threading.Lock()
+_HISTORY_WRITE_STARTED = False
+
+
+def _history_write_worker() -> None:
+    while True:
+        time.sleep(2.0)
+        with _HISTORY_WRITE_LOCK:
+            pending_callbacks = list(_HISTORY_WRITE_PENDING.values())
+            _HISTORY_WRITE_PENDING.clear()
+        for callback in pending_callbacks:
+            try:
+                callback()
+            except Exception:
+                continue
+
+
+def ensure_history_write_worker() -> None:
+    global _HISTORY_WRITE_STARTED
+    with _HISTORY_WRITE_LOCK:
+        if _HISTORY_WRITE_STARTED:
+            return
+        _HISTORY_WRITE_STARTED = True
+    thread = threading.Thread(target=_history_write_worker, daemon=True, name="history-write-worker")
+    thread.start()
+
+
+def schedule_history_write(write_key: str, callback: Callable[[], None]) -> None:
+    ensure_history_write_worker()
+    with _HISTORY_WRITE_LOCK:
+        _HISTORY_WRITE_PENDING[write_key] = callback
+
+
+def clear_local_runtime_caches() -> None:
+    cache = _derived_cache_store()
+    cache.clear()
+    with _STALE_RESULT_LOCK:
+        _STALE_RESULT_CACHE.clear()
+    with _LOCAL_TTL_CACHE_LOCK:
+        _LOCAL_TTL_CACHE.clear()
 
 
 def _schedule_stale_result_refresh(
@@ -4267,6 +4426,29 @@ def build_alert_brief_lines(
     return lines
 
 
+def _headline_items_from_lines(
+    kind: str,
+    lines: List[str],
+    *,
+    section_target: str,
+    overview_target: str,
+) -> List[Dict[str, str]]:
+    items: List[Dict[str, str]] = []
+    for line in lines:
+        text = str(line or "").strip()
+        if not text:
+            continue
+        items.append(
+            {
+                "kind": kind,
+                "label": text,
+                "tag_target": section_target,
+                "body_target": overview_target or section_target,
+            }
+        )
+    return items
+
+
 def build_home_headline_items(
     base_coin: str,
     snapshot_by_key: Dict[str, ExchangeSnapshot],
@@ -4278,58 +4460,109 @@ def build_home_headline_items(
     liquidation_window_minutes: int,
     large_trade_frame: pd.DataFrame | None = None,
     confirmed_alert_frame: pd.DataFrame | None = None,
+    kind_targets: Dict[str, str] | None = None,
     limit: int = 12,
-) -> List[str]:
-    items: List[str] = []
+) -> List[Dict[str, str]]:
+    kind_targets = dict(kind_targets or {})
+    overview_target = str(kind_targets.get("overview") or "section-home-overview")
+    items: List[Dict[str, str]] = []
     items.extend(
-        build_oi_brief_lines(
-            base_coin,
-            snapshot_by_key,
-            oi_metrics_by_exchange,
-            exchange_keys=exchange_keys,
+        _headline_items_from_lines(
+            "oi",
+            build_oi_brief_lines(
+                base_coin,
+                snapshot_by_key,
+                oi_metrics_by_exchange,
+                exchange_keys=exchange_keys,
+            ),
+            section_target=str(kind_targets.get("oi") or overview_target),
+            overview_target=overview_target,
         )
     )
     items.extend(
-        build_liquidation_brief_lines(
-            base_coin,
-            liquidation_metrics_by_exchange,
-            exchange_keys=exchange_keys,
+        _headline_items_from_lines(
+            "liquidation",
+            build_liquidation_brief_lines(
+                base_coin,
+                liquidation_metrics_by_exchange,
+                exchange_keys=exchange_keys,
+            ),
+            section_target=str(kind_targets.get("liquidation") or overview_target),
+            overview_target=overview_target,
         )
     )
     items.extend(
-        build_trade_impulse_brief_lines(
-            base_coin,
-            trade_metrics_by_exchange,
-            exchange_keys=exchange_keys,
-            window_minutes=liquidation_window_minutes,
+        _headline_items_from_lines(
+            "trade",
+            build_trade_impulse_brief_lines(
+                base_coin,
+                trade_metrics_by_exchange,
+                exchange_keys=exchange_keys,
+                window_minutes=liquidation_window_minutes,
+            ),
+            section_target=str(kind_targets.get("trade") or overview_target),
+            overview_target=overview_target,
         )
     )
     if confirmed_alert_frame is not None:
-        items.extend(build_alert_brief_lines(confirmed_alert_frame, exchange_keys=exchange_keys))
+        items.extend(
+            _headline_items_from_lines(
+                "alert",
+                build_alert_brief_lines(confirmed_alert_frame, exchange_keys=exchange_keys),
+                section_target=str(kind_targets.get("alert") or overview_target),
+                overview_target=overview_target,
+            )
+        )
     if large_trade_frame is not None:
-        items.extend(build_large_trade_brief_lines(large_trade_frame))
-    normalized_items: List[str] = []
+        items.extend(
+            _headline_items_from_lines(
+                "large",
+                build_large_trade_brief_lines(large_trade_frame),
+                section_target=str(kind_targets.get("large") or overview_target),
+                overview_target=overview_target,
+            )
+        )
+    normalized_items: List[Dict[str, str]] = []
     seen = set()
     for item in items:
-        text = str(item or "").strip()
+        text = str(item.get("label") or "").strip()
         if not text or text in seen:
             continue
         seen.add(text)
-        normalized_items.append(text)
+        normalized_items.append(item)
         if len(normalized_items) >= max(limit, 1):
             break
     return normalized_items
 
 
-def render_home_headline_marquee(container, items: List[str]) -> None:
-    normalized_items = [str(item).strip() for item in items if str(item).strip()]
+def _normalize_headline_href(anchor_id: str | None) -> str:
+    anchor = str(anchor_id or "").strip()
+    return f"#{anchor}" if anchor else ""
+
+
+def render_home_headline_marquee(container, items: List[Dict[str, str]]) -> None:
+    normalized_items = [item for item in items if str(item.get("label") or "").strip()]
     if not normalized_items:
         container.empty()
         return
-    chips_html = "".join(
-        f"<span class='headline-marquee-chip'>{html_escape(item)}</span>"
-        for item in normalized_items
-    )
+    chips_html = ""
+    for item in normalized_items:
+        kind = str(item.get("kind") or "trade").strip().lower()
+        label = str(item.get("label") or "").strip()
+        tag_text = HEADLINE_KIND_LABELS.get(kind, kind.upper())
+        tag_href = _normalize_headline_href(item.get("tag_target"))
+        body_href = _normalize_headline_href(item.get("body_target")) or tag_href
+        tag_html = (
+            f"<a class='headline-marquee-tag headline-tag-{kind}' href='{html_escape(tag_href)}'>{html_escape(tag_text)}</a>"
+            if tag_href
+            else f"<span class='headline-marquee-tag headline-tag-{kind}'>{html_escape(tag_text)}</span>"
+        )
+        body_html = (
+            f"<a class='headline-marquee-text' href='{html_escape(body_href)}'>{html_escape(label)}</a>"
+            if body_href
+            else f"<span class='headline-marquee-text'>{html_escape(label)}</span>"
+        )
+        chips_html += f"<span class='headline-marquee-chip headline-chip-{kind}'>{tag_html}{body_html}</span>"
     container.markdown(
         f"""
         <div class="headline-marquee-shell">
@@ -4383,9 +4616,29 @@ def latest_payload_float(payload: Dict[str, List[dict]], dataset_key: str, field
     return None if pd.isna(value) else float(value)
 
 
-def render_section(title: str, subtitle: str = "", kicker: str = "Desk") -> None:
+def _render_section_anchor_html(anchor_id: str | None = None, anchor_aliases: List[str] | None = None) -> str:
+    anchors = [str(anchor_id or "").strip(), *[str(item).strip() for item in (anchor_aliases or [])]]
+    unique_anchors: List[str] = []
+    seen = set()
+    for anchor in anchors:
+        if not anchor or anchor in seen:
+            continue
+        seen.add(anchor)
+        unique_anchors.append(anchor)
+    return "".join(f"<div id='{html_escape(anchor)}' class='section-anchor'></div>" for anchor in unique_anchors)
+
+
+def render_section(
+    title: str,
+    subtitle: str = "",
+    kicker: str = "Desk",
+    *,
+    anchor_id: str | None = None,
+    anchor_aliases: List[str] | None = None,
+) -> None:
     subtitle_html = f"<div class='glass-sub'>{subtitle}</div>" if subtitle else ""
     st.markdown(
+        f"{_render_section_anchor_html(anchor_id, anchor_aliases)}"
         f"<div class='glass-section'><div class='glass-kicker'>{kicker}</div><div class='glass-title'>{title}</div>{subtitle_html}</div>",
         unsafe_allow_html=True,
     )
@@ -5046,32 +5299,28 @@ coin_catalog_options = order_coin_options(list(coin_catalog_payload.get("coins")
 if not coin_catalog_options:
     coin_catalog_options = order_coin_options(POPULAR_COINS)
 coin_catalog_summary = coin_catalog_payload.get("summary") or {}
-preset_coin = st.sidebar.selectbox(
-    "全所币种搜索",
-    coin_catalog_options,
-    index=pick_option_index(
+address_pool_import_errors: List[str] = []
+with st.sidebar.form("sidebar-controls", clear_on_submit=False):
+    preset_coin = st.selectbox(
+        "全所币种搜索",
         coin_catalog_options,
-        ui_preferences.get("catalog_coin") or ui_preferences.get("preset_coin"),
-        POPULAR_COINS[0],
-    ),
-)
-custom_coin = st.sidebar.text_input(
-    "自定义币种",
-    value=str(ui_preferences.get("custom_coin") or ""),
-    placeholder="目录里没有就手动输入，比如 PEPE / TAO / FARTCOIN",
-)
-base_coin = custom_coin.strip().upper() if custom_coin.strip() else preset_coin
-st.sidebar.caption("下拉框现在是全交易所币种目录，展开后可以直接键盘搜索；手动输入会覆盖下拉选择。")
-catalog_summary_text = build_catalog_summary_text(coin_catalog_summary, coin_catalog_status)
-st.sidebar.caption("目录覆盖: " + catalog_summary_text)
-st.sidebar.caption(build_coin_availability_caption(base_coin, coin_catalog_payload.get("availability") or {}, coin_catalog_status))
-base_defaults = default_symbols(base_coin)
-if st.session_state.get("symbol_base_coin") != base_coin:
-    for key in ("bybit", "binance", "okx", "hyperliquid"):
-        st.session_state[f"symbol_{key}"] = base_defaults[key]
-    st.session_state["symbol_base_coin"] = base_coin
+        index=pick_option_index(
+            coin_catalog_options,
+            ui_preferences.get("catalog_coin") or ui_preferences.get("preset_coin"),
+            POPULAR_COINS[0],
+        ),
+    )
+    custom_coin = st.text_input(
+        "自定义币种",
+        value=str(ui_preferences.get("custom_coin") or ""),
+        placeholder="目录里没有就手动输入，比如 PEPE / TAO / FARTCOIN",
+    )
+    base_coin = custom_coin.strip().upper() if custom_coin.strip() else preset_coin
+    st.caption("下拉框现在是全交易所币种目录，展开后可以直接键盘搜索；手动输入会覆盖下拉选择。")
+    catalog_summary_text = build_catalog_summary_text(coin_catalog_summary, coin_catalog_status)
+    st.caption("目录覆盖: " + catalog_summary_text)
+    st.caption(build_coin_availability_caption(base_coin, coin_catalog_payload.get("availability") or {}, coin_catalog_status))
 
-with st.sidebar:
     st.header("终端参数")
     st.caption(f"当前基础币种: {base_coin}")
     overview_coin_options = list(dict.fromkeys([base_coin] + coin_catalog_options))
@@ -5124,6 +5373,7 @@ with st.sidebar:
     st.caption("轻量模式会缩短实时缓冲历史，减少深度页、盘口质量和回放占用。")
     st.caption("测试视角会自动记住到本地，下次打开会恢复最近一次选择。")
     st.markdown("---")
+
     st.subheader("Hyperliquid 地址模式")
     hyperliquid_address_source = st.selectbox(
         "地址来源",
@@ -5159,17 +5409,6 @@ with st.sidebar:
         placeholder="每行一个，格式：标签|地址|分组\n例如：鲸鱼A|0xabc...|鲸鱼\nVault观察|0xdef...|Vault",
         height=96,
     )
-    import_address_pool = st.button("导入地址到地址池")
-    clear_custom_address_pool = st.button("清空自定义地址池")
-    address_pool_import_errors: List[str] = []
-    if import_address_pool:
-        imported_entries, address_pool_import_errors = parse_hyperliquid_address_pool_text(address_pool_import_text)
-        if imported_entries:
-            custom_hyperliquid_pool_entries = merge_address_pool_entries(custom_hyperliquid_pool_entries, imported_entries)
-    if clear_custom_address_pool:
-        custom_hyperliquid_pool_entries = []
-    if address_pool_import_errors:
-        st.caption("导入时忽略了这些行: " + " | ".join(address_pool_import_errors[:4]))
     address_option_catalog = build_watch_option_catalog(custom_hyperliquid_pool_entries)
     address_watch_options = [item["option"] for item in address_option_catalog]
     address_watch_groups = list(dict.fromkeys([str(item.get("group") or "默认") for item in address_option_catalog] + ["当前输入"]))
@@ -5195,6 +5434,7 @@ with st.sidebar:
     )
     st.caption(f"当前可选观察地址 {len(address_watch_options)} 个，分组 {len(address_watch_groups)} 个。当前地址如果有效，也会自动加入。")
     st.markdown("---")
+
     st.subheader("通知 / 历史")
     alert_confirm_after = st.slider(
         "告警确认次数",
@@ -5264,6 +5504,7 @@ with st.sidebar:
     )
     st.caption("通知和凭据只保存在本地偏好文件里，不会发到别处。")
     st.markdown("---")
+
     st.subheader("跨币种联动")
     cross_coin_pool_options = list(dict.fromkeys([base_coin] + coin_catalog_options))
     default_cross_coin_pool = pick_option_list(
@@ -5279,14 +5520,35 @@ with st.sidebar:
         max_selections=6,
     )
     st.markdown("---")
+
     st.subheader("合约映射")
+    base_defaults = default_symbols(base_coin)
+    if st.session_state.get("symbol_base_coin") != base_coin:
+        for key in ("bybit", "binance", "okx", "hyperliquid"):
+            st.session_state[f"symbol_{key}"] = base_defaults[key]
+        st.session_state["symbol_base_coin"] = base_coin
     bybit_symbol = st.text_input("Bybit 合约", key="symbol_bybit")
     binance_symbol = st.text_input("Binance 合约", key="symbol_binance")
     okx_symbol = st.text_input("OKX 合约", key="symbol_okx")
     hyper_symbol = st.text_input("Hyperliquid 币种", key="symbol_hyperliquid")
-    restore_defaults = st.button("恢复默认合约")
-    clear_cache = st.button("清空缓存")
-    restart_feed = st.button("重连实时流")
+    st.caption("参数会在点击下方按钮后统一提交，避免每次拖动都整页重算。")
+    primary_action_cols = st.columns(3)
+    apply_sidebar = primary_action_cols[0].form_submit_button("应用参数", use_container_width=True)
+    import_address_pool = primary_action_cols[1].form_submit_button("导入地址池", use_container_width=True)
+    clear_custom_address_pool = primary_action_cols[2].form_submit_button("清空地址池", use_container_width=True)
+    secondary_action_cols = st.columns(3)
+    restore_defaults = secondary_action_cols[0].form_submit_button("恢复默认合约", use_container_width=True)
+    clear_cache = secondary_action_cols[1].form_submit_button("清空缓存", use_container_width=True)
+    restart_feed = secondary_action_cols[2].form_submit_button("重连实时流", use_container_width=True)
+
+if import_address_pool:
+    imported_entries, address_pool_import_errors = parse_hyperliquid_address_pool_text(address_pool_import_text)
+    if imported_entries:
+        custom_hyperliquid_pool_entries = merge_address_pool_entries(custom_hyperliquid_pool_entries, imported_entries)
+if clear_custom_address_pool:
+    custom_hyperliquid_pool_entries = []
+if address_pool_import_errors:
+    st.sidebar.caption("导入时忽略了这些行: " + " | ".join(address_pool_import_errors[:4]))
 
 if not overview_coins:
     overview_coins = [base_coin]
@@ -5335,6 +5597,10 @@ if restore_defaults:
     st.rerun()
 if clear_cache:
     st.cache_data.clear()
+    clear_local_runtime_caches()
+    st.rerun()
+if import_address_pool or clear_custom_address_pool:
+    st.rerun()
 
 symbol_map = {
     "bybit": bybit_symbol.strip().upper(),
@@ -5469,6 +5735,17 @@ def render_terminal() -> None:
             default=pick_option(LAB_VIEW_OPTIONS, ui_preferences.get("lab_mode"), LAB_VIEW_OPTIONS[0]),
         )
         st.caption("这里把 Hyperliquid 独有 API、多交易所聚合、策略层信号、通知与持久化集中到一个独立试验台里，不改你原来的主工作流。")
+    refresh_profile = build_refresh_profile(
+        refresh_seconds,
+        active_view=active_view,
+        overview_mode=overview_mode,
+        lab_mode=lab_mode,
+    )
+    fast_ttl = int(refresh_profile["fast_ttl"])
+    balanced_ttl = int(refresh_profile["balanced_ttl"])
+    heavy_ttl = int(refresh_profile["heavy_ttl"])
+    stale_ttl = int(refresh_profile["stale_ttl"])
+    prefetch_age = int(refresh_profile["prefetch_age"])
     save_local_ui_preferences(
         {
             "catalog_coin": preset_coin,
@@ -5603,7 +5880,10 @@ def render_terminal() -> None:
         snapshot = snapshot_by_key[exchange_key]
         col.metric(snapshot.exchange, fmt_price(snapshot.last_price), delta=f"OI {fmt_compact(snapshot.open_interest_notional)}")
     if history_sqlite_enabled:
-        history_store.record_snapshots(base_coin, snapshot_by_key)
+        schedule_history_write(
+            f"snapshots::{base_coin}::perp",
+            lambda store=history_store, coin=base_coin, snapshots=dict(snapshot_by_key): store.record_snapshots(coin, snapshots),
+        )
     archive_events = maybe_run_auto_archive(
         history_store,
         enabled=bool(history_sqlite_enabled and auto_archive_enabled),
@@ -5671,10 +5951,22 @@ def render_terminal() -> None:
                 liquidation_window_minutes=liquidation_window_minutes,
                 large_trade_frame=light_large_trade_frame,
                 confirmed_alert_frame=pd.DataFrame(),
+                kind_targets={
+                    "overview": "section-home-exchange-compare",
+                    "oi": "section-home-oi",
+                    "liquidation": "section-home-liquidation",
+                    "trade": "section-home-movers",
+                    "large": "section-home-large-perp",
+                    "alert": "section-home-movers",
+                },
                 limit=8,
             ),
         )
-        render_section("竞品级首页", "轻量模式先看主结论、全市场总览板和异动榜，需要更细的盘口和联动再切去深度页或中心页。")
+        render_section(
+            "竞品级首页",
+            "轻量模式先看主结论、全市场总览板和异动榜，需要更细的盘口和联动再切去深度页或中心页。",
+            anchor_id="section-home-hero",
+        )
         conclusion_cards = st.columns(4)
         conclusion_cards[0].metric("当前主结论", str(selected_overview_row.get("主结论") or "信号混合"))
         conclusion_cards[1].metric("短线驱动", str(selected_overview_row.get("Lead/Lag") or "样本不足"))
@@ -5688,7 +5980,12 @@ def render_terminal() -> None:
         for line in home_lines:
             st.markdown(f"- {line}")
 
-        render_section("全市场总览板", "按币种把价格、OI、OI 1h/24h、Funding、爆仓样本、多空比、现货/合约成交比和 Lead/Lag 放在一张榜单里。")
+        render_section(
+            "全市场总览板",
+            "按币种把价格、OI、OI 1h/24h、Funding、爆仓样本、多空比、现货/合约成交比和 Lead/Lag 放在一张榜单里。",
+            anchor_id="section-home-overview",
+            anchor_aliases=["section-home-oi"],
+        )
         if overview_frame.empty:
             st.info("当前首页币种池还没有可展示的数据。")
         else:
@@ -5709,7 +6006,12 @@ def render_terminal() -> None:
                 },
             )
 
-        render_section("异动榜", "把 OI 激增、爆仓放大、Funding 极值、合约情绪极值、现货先动、拥挤但衰竭 这六类异动拆开看。")
+        render_section(
+            "异动榜",
+            "把 OI 激增、爆仓放大、Funding 极值、合约情绪极值、现货先动、拥挤但衰竭 这六类异动拆开看。",
+            anchor_id="section-home-movers",
+            anchor_aliases=["section-home-liquidation", "section-home-large-perp"],
+        )
         oi_movers = build_movers_frame(overview_frame, "OI 1h(%)", limit=5, ascending=False)
         liq_movers = build_movers_frame(overview_frame, "24h爆仓样本额", limit=5, ascending=False)
         funding_movers = (
@@ -5753,7 +6055,11 @@ def render_terminal() -> None:
                 else:
                     st.dataframe(frame[["币种", "主结论", focus_column]], width="stretch", hide_index=True)
 
-        render_section("全市场对比" if exchange_scope_mode == "全部交易所" else "当前交易所对比", "横向比较价格、持仓、费率和成交额。")
+        render_section(
+            "全市场对比" if exchange_scope_mode == "全部交易所" else "当前交易所对比",
+            "横向比较价格、持仓、费率和成交额。",
+            anchor_id="section-home-exchange-compare",
+        )
         st.dataframe(build_snapshot_frame(scope_snapshots if exchange_scope_mode == "当前交易所优先" else snapshots), width="stretch", hide_index=True)
         render_section("持仓总量 / 未平仓对比", "公开 API 下，这里的未平仓就是合约 OI；现货市场不存在 OI 概念。")
         oi_left, oi_right = st.columns([1.6, 1.35], gap="large")
@@ -6038,10 +6344,13 @@ def render_terminal() -> None:
                     request_timeout,
                 )
         if history_sqlite_enabled and spot_snapshot_map:
-            history_store.record_snapshots(
-                base_coin,
-                {key: value for key, value in spot_snapshot_map.items() if key in SPOT_EXCHANGE_ORDER},
-                market="spot",
+            schedule_history_write(
+                f"snapshots::{base_coin}::spot",
+                lambda store=history_store, coin=base_coin, snapshots={key: value for key, value in spot_snapshot_map.items() if key in SPOT_EXCHANGE_ORDER}: store.record_snapshots(
+                    coin,
+                    snapshots,
+                    market="spot",
+                ),
             )
         alert_input_signature = (
             base_coin,
@@ -6171,7 +6480,15 @@ def render_terminal() -> None:
         st.session_state[f"alert_engine_state::{alert_scope_key}"] = next_alert_state
         st.session_state[f"alert_engine_timeline::{alert_scope_key}"] = next_alert_timeline
         if history_sqlite_enabled:
-            history_store.record_alert_timeline(base_coin, alert_timeline_frame, symbol_map=symbol_map, exchange_title_map=EXCHANGE_TITLES)
+            schedule_history_write(
+                f"alerts::{base_coin}::center",
+                lambda store=history_store, coin=base_coin, frame=alert_timeline_frame.copy(), symbols=dict(symbol_map): store.record_alert_timeline(
+                    coin,
+                    frame,
+                    symbol_map=symbols,
+                    exchange_title_map=EXCHANGE_TITLES,
+                ),
+            )
         alert_center_notifications = collect_new_alert_notifications(alert_timeline_frame, base_coin=base_coin)
         if browser_notify_enabled:
             routed_browser = route_alert_notifications(
@@ -6413,7 +6730,7 @@ def render_terminal() -> None:
         riskmap_bundle = get_cached_derived_result(
             f"riskmaps::{selected_exchange}::{selected_symbol}::{interval}",
             riskmap_signature,
-            ttl_seconds=max(4, refresh_seconds),
+            ttl_seconds=balanced_ttl,
             builder=lambda: {
                 "liquidation": build_probability_heatmap_frame(candles, orderbook, selected_snapshot, "liquidation", reference_price, risk_heat_window_pct, risk_heat_buckets),
                 "tp": build_probability_heatmap_frame(candles, orderbook, selected_snapshot, "tp", reference_price, risk_heat_window_pct, risk_heat_buckets),
@@ -6498,10 +6815,11 @@ def render_terminal() -> None:
         request_timeout,
     )
     oi_matrix_metrics = (
-        get_cached_derived_result(
+        get_stale_while_revalidate_result(
             f"oi-matrix::{selected_exchange}::{selected_symbol}::{interval}",
             oi_matrix_signature,
-            ttl_seconds=max(6, refresh_seconds),
+            ttl_seconds=heavy_ttl,
+            stale_ttl_seconds=stale_ttl,
             builder=lambda: {
                 matrix_interval: build_oi_quadrant_metrics(
                     merge_oi_points(
@@ -6517,11 +6835,27 @@ def render_terminal() -> None:
         else {}
     )
     now_ms = selected_snapshot.timestamp_ms or int(time.time() * 1000)
-    overview_frame = (
-        load_market_overview_frame_cached(tuple(dict.fromkeys(overview_coins)), request_timeout, liquidation_limit)
-        if active_view == "首页总览" and overview_mode == "完整"
-        else pd.DataFrame()
-    )
+    overview_signature = (tuple(dict.fromkeys(overview_coins)), int(request_timeout), int(liquidation_limit))
+    overview_builder = lambda: load_market_overview_frame_cached(tuple(dict.fromkeys(overview_coins)), request_timeout, liquidation_limit)
+    if need_home_full:
+        overview_frame = get_stale_while_revalidate_result(
+            f"home-overview-full::{base_coin}",
+            overview_signature,
+            ttl_seconds=heavy_ttl,
+            stale_ttl_seconds=stale_ttl,
+            builder=overview_builder,
+        )
+        if overview_frame is None:
+            overview_frame = pd.DataFrame()
+    else:
+        overview_frame = pd.DataFrame()
+        if overview_coins:
+            prefetch_stale_result(
+                f"home-overview-full::{base_coin}",
+                overview_signature,
+                overview_builder,
+                max_age_seconds=prefetch_age,
+            )
     spot_metrics = build_spot_perp_metrics(spot_snapshot, home_perp_snapshot, spot_orderbook, home_perp_orderbook, spot_trades)
     spot_summary = summarize_orderbook(spot_orderbook, spot_snapshot.last_price if spot_snapshot.status == "ok" else None)
     binance_perp_summary = summarize_orderbook(home_perp_orderbook, home_perp_snapshot.last_price)
@@ -6739,7 +7073,15 @@ def render_terminal() -> None:
         st.session_state[f"alert_engine_state::{alert_scope_key}"] = next_alert_state
         st.session_state[f"alert_engine_timeline::{alert_scope_key}"] = next_alert_timeline
         if history_sqlite_enabled:
-            history_store.record_alert_timeline(base_coin, alert_timeline_frame, symbol_map=symbol_map, exchange_title_map=EXCHANGE_TITLES)
+            schedule_history_write(
+                f"alerts::{base_coin}::multi",
+                lambda store=history_store, coin=base_coin, frame=alert_timeline_frame.copy(), symbols=dict(symbol_map): store.record_alert_timeline(
+                    coin,
+                    frame,
+                    symbol_map=symbols,
+                    exchange_title_map=EXCHANGE_TITLES,
+                ),
+            )
         new_alert_notifications = collect_new_alert_notifications(alert_timeline_frame, base_coin=base_coin)
         cross_liq_signature = tuple(
             (
@@ -6752,7 +7094,7 @@ def render_terminal() -> None:
         cross_exchange_session_liqs = get_cached_derived_result(
             f"cross-liq::{base_coin}::{interval}",
             cross_liq_signature,
-            ttl_seconds=max(4, refresh_seconds),
+            ttl_seconds=balanced_ttl,
             builder=lambda: [event for exchange_key in available_perp_keys for event in service.get_liquidation_history(exchange_key)],
         )
     selected_display_name = EXCHANGE_TITLES[selected_exchange]
@@ -6771,7 +7113,7 @@ def render_terminal() -> None:
         EXCHANGE_TITLES,
         exchange_keys=scope_perp_keys if exchange_scope_mode == "当前交易所优先" else list(EXCHANGE_ORDER),
     )
-    contract_sentiment_alert_frame = build_contract_sentiment_alert_frame(contract_sentiment_frame)
+    contract_sentiment_alert_frame = build_contract_sentiment_alert_frame(contract_sentiment_frame) if need_home_full else pd.DataFrame()
     deep_spot_dashboard_frame = (
         build_spot_dashboard_frame(spot_snapshot_map, spot_summary_map, lead_lag_frame, exchange_keys=scope_spot_keys)
         if need_deep_view and exchange_scope_mode == "全部交易所"
@@ -6799,90 +7141,113 @@ def render_terminal() -> None:
         if symbol_map.get(exchange_key)
     }
     spot_reference_window_minutes = max(10, min(20, liquidation_window_minutes))
-    bybit_insurance_payload = load_bybit_insurance_cached(base_coin, request_timeout) if "bybit" in perp_reference_exchange_keys else {}
+    bybit_insurance_payload = load_bybit_insurance_cached(base_coin, request_timeout) if need_home_full and "bybit" in perp_reference_exchange_keys else {}
     bybit_insurance_value = payload_float(bybit_insurance_payload.get("total_value")) if isinstance(bybit_insurance_payload, dict) else None
-    spot_reference_payload = get_cached_derived_result(
-        f"spot-reference::{base_coin}::{exchange_scope_mode}",
-        (
-            tuple(
-                (
-                    exchange_key,
-                    int(spot_snapshot_map.get(exchange_key).timestamp_ms or 0) if spot_snapshot_map.get(exchange_key) is not None else 0,
-                    len(spot_orderbook_map.get(exchange_key, [])),
-                    len(spot_trades_map.get(exchange_key, [])),
-                    _latest_trade_timestamp(spot_trades_map.get(exchange_key, [])) or 0,
-                    len(spot_quality_history_by_exchange.get(exchange_key, [])),
-                    spot_quality_history_by_exchange.get(exchange_key)[-1].timestamp_ms if spot_quality_history_by_exchange.get(exchange_key) else 0,
-                )
-                for exchange_key in spot_reference_exchange_keys
-            ),
-            int(spot_reference_window_minutes),
+    spot_reference_signature = (
+        tuple(
+            (
+                exchange_key,
+                int(spot_snapshot_map.get(exchange_key).timestamp_ms or 0) if spot_snapshot_map.get(exchange_key) is not None else 0,
+                len(spot_orderbook_map.get(exchange_key, [])),
+                len(spot_trades_map.get(exchange_key, [])),
+                _latest_trade_timestamp(spot_trades_map.get(exchange_key, [])) or 0,
+                len(spot_quality_history_by_exchange.get(exchange_key, [])),
+                spot_quality_history_by_exchange.get(exchange_key)[-1].timestamp_ms if spot_quality_history_by_exchange.get(exchange_key) else 0,
+            )
+            for exchange_key in spot_reference_exchange_keys
         ),
-        ttl_seconds=max(4, refresh_seconds),
-        builder=lambda: {
-            "flow_frame": build_spot_flow_reference_frame(
-                spot_snapshot_map,
-                spot_orderbook_map,
-                spot_trades_map,
-                EXCHANGE_TITLES,
-                exchange_keys=spot_reference_exchange_keys,
-                now_ms=now_ms,
-                window_minutes=spot_reference_window_minutes,
-            ),
-            "execution_frame": build_execution_quality_frame(
-                spot_snapshot_map,
-                spot_orderbook_map,
-                spot_quality_history_by_exchange,
-                EXCHANGE_TITLES,
-                exchange_keys=spot_reference_exchange_keys,
-                market_label="现货",
-            ),
-        },
+        int(spot_reference_window_minutes),
     )
+    spot_reference_builder = lambda: {
+        "flow_frame": build_spot_flow_reference_frame(
+            spot_snapshot_map,
+            spot_orderbook_map,
+            spot_trades_map,
+            spot_quality_history_by_exchange,
+            EXCHANGE_TITLES,
+            exchange_keys=spot_reference_exchange_keys,
+            now_ms=now_ms,
+            window_minutes=spot_reference_window_minutes,
+        ),
+        "execution_frame": build_execution_quality_frame(
+            spot_snapshot_map,
+            spot_orderbook_map,
+            spot_quality_history_by_exchange,
+            EXCHANGE_TITLES,
+            exchange_keys=spot_reference_exchange_keys,
+            market_label="现货",
+        ),
+    }
+    perp_reference_signature = (
+        tuple(
+            (
+                exchange_key,
+                int(snapshot_by_key.get(exchange_key).timestamp_ms or 0) if snapshot_by_key.get(exchange_key) is not None else 0,
+                len(perp_orderbook_map.get(exchange_key, [])),
+                len(perp_quality_history_by_exchange.get(exchange_key, [])),
+                perp_quality_history_by_exchange.get(exchange_key)[-1].timestamp_ms if perp_quality_history_by_exchange.get(exchange_key) else 0,
+                len(trade_events_by_exchange.get(exchange_key, [])),
+                _latest_trade_timestamp(trade_events_by_exchange.get(exchange_key, [])) or 0,
+            )
+            for exchange_key in perp_reference_exchange_keys
+        ),
+        int(bybit_insurance_payload.get("updated_time_ms") or 0) if isinstance(bybit_insurance_payload, dict) else 0,
+    )
+    perp_reference_builder = lambda: {
+        "crowding_frame": build_perp_crowding_trio_frame(contract_sentiment_frame, oi_metrics_by_exchange),
+        "funding_frame": build_funding_regime_frame(
+            snapshot_by_key,
+            spot_snapshot_map,
+            EXCHANGE_TITLES,
+            exchange_keys=perp_reference_exchange_keys,
+        ),
+        "execution_frame": build_execution_quality_frame(
+            snapshot_by_key,
+            perp_orderbook_map,
+            perp_quality_history_by_exchange,
+            EXCHANGE_TITLES,
+            exchange_keys=perp_reference_exchange_keys,
+            market_label="合约",
+        ),
+        "risk_buffer_frame": build_risk_buffer_frame(
+            snapshot_by_key,
+            EXCHANGE_TITLES,
+            exchange_keys=perp_reference_exchange_keys,
+            bybit_insurance_value=bybit_insurance_value,
+        ),
+    }
+    if need_home_full:
+        spot_reference_payload = get_stale_while_revalidate_result(
+            f"spot-reference::{base_coin}::{exchange_scope_mode}",
+            spot_reference_signature,
+            ttl_seconds=balanced_ttl,
+            stale_ttl_seconds=stale_ttl,
+            builder=spot_reference_builder,
+        ) or {}
+        perp_reference_payload = get_stale_while_revalidate_result(
+            f"perp-reference::{base_coin}::{exchange_scope_mode}",
+            perp_reference_signature,
+            ttl_seconds=balanced_ttl,
+            stale_ttl_seconds=stale_ttl,
+            builder=perp_reference_builder,
+        ) or {}
+    else:
+        spot_reference_payload = {}
+        perp_reference_payload = {}
+        prefetch_stale_result(
+            f"spot-reference::{base_coin}::{exchange_scope_mode}",
+            spot_reference_signature,
+            spot_reference_builder,
+            max_age_seconds=prefetch_age,
+        )
+        prefetch_stale_result(
+            f"perp-reference::{base_coin}::{exchange_scope_mode}",
+            perp_reference_signature,
+            perp_reference_builder,
+            max_age_seconds=prefetch_age,
+        )
     spot_flow_reference_frame = spot_reference_payload.get("flow_frame", pd.DataFrame())
     spot_execution_frame = spot_reference_payload.get("execution_frame", pd.DataFrame())
-    perp_reference_payload = get_cached_derived_result(
-        f"perp-reference::{base_coin}::{exchange_scope_mode}",
-        (
-            tuple(
-                (
-                    exchange_key,
-                    int(snapshot_by_key.get(exchange_key).timestamp_ms or 0) if snapshot_by_key.get(exchange_key) is not None else 0,
-                    len(perp_orderbook_map.get(exchange_key, [])),
-                    len(perp_quality_history_by_exchange.get(exchange_key, [])),
-                    perp_quality_history_by_exchange.get(exchange_key)[-1].timestamp_ms if perp_quality_history_by_exchange.get(exchange_key) else 0,
-                    len(trade_events_by_exchange.get(exchange_key, [])),
-                    _latest_trade_timestamp(trade_events_by_exchange.get(exchange_key, [])) or 0,
-                )
-                for exchange_key in perp_reference_exchange_keys
-            ),
-            int(bybit_insurance_payload.get("updated_time_ms") or 0) if isinstance(bybit_insurance_payload, dict) else 0,
-        ),
-        ttl_seconds=max(4, refresh_seconds),
-        builder=lambda: {
-            "crowding_frame": build_perp_crowding_trio_frame(contract_sentiment_frame, oi_metrics_by_exchange),
-            "funding_frame": build_funding_regime_frame(
-                snapshot_by_key,
-                spot_snapshot_map,
-                EXCHANGE_TITLES,
-                exchange_keys=perp_reference_exchange_keys,
-            ),
-            "execution_frame": build_execution_quality_frame(
-                snapshot_by_key,
-                perp_orderbook_map,
-                perp_quality_history_by_exchange,
-                EXCHANGE_TITLES,
-                exchange_keys=perp_reference_exchange_keys,
-                market_label="合约",
-            ),
-            "risk_buffer_frame": build_risk_buffer_frame(
-                snapshot_by_key,
-                EXCHANGE_TITLES,
-                exchange_keys=perp_reference_exchange_keys,
-                bybit_insurance_value=bybit_insurance_value,
-            ),
-        },
-    )
     perp_crowding_trio_frame = perp_reference_payload.get("crowding_frame", pd.DataFrame())
     funding_regime_frame = perp_reference_payload.get("funding_frame", pd.DataFrame())
     perp_execution_frame = perp_reference_payload.get("execution_frame", pd.DataFrame())
@@ -6891,15 +7256,19 @@ def render_terminal() -> None:
     share_baseline_entry = st.session_state.get(share_baseline_key, {})
     share_baseline_records = share_baseline_entry.get("records") if isinstance(share_baseline_entry, dict) else None
     share_baseline_ts = int(share_baseline_entry.get("ts_ms") or 0) if isinstance(share_baseline_entry, dict) else 0
-    share_dynamics_frame = build_exchange_share_dynamics_frame(
-        snapshot_by_key,
-        spot_snapshot_map,
-        EXCHANGE_TITLES,
-        exchange_keys=perp_reference_exchange_keys,
-        previous_records=share_baseline_records,
+    share_dynamics_frame = (
+        build_exchange_share_dynamics_frame(
+            snapshot_by_key,
+            spot_snapshot_map,
+            EXCHANGE_TITLES,
+            exchange_keys=perp_reference_exchange_keys,
+            previous_records=share_baseline_records,
+        )
+        if need_home_full
+        else pd.DataFrame()
     )
     share_baseline_label = format_share_baseline_age(share_baseline_ts if share_baseline_records else None, now_ms)
-    if not share_baseline_entry or now_ms - share_baseline_ts >= max(60_000, refresh_seconds * 15 * 1000):
+    if need_home_full and (not share_baseline_entry or now_ms - share_baseline_ts >= max(60_000, refresh_seconds * 15 * 1000)):
         st.session_state[share_baseline_key] = {
             "ts_ms": now_ms,
             "records": share_dynamics_frame[
@@ -6937,6 +7306,19 @@ def render_terminal() -> None:
             )
         live_hyperliquid_bundle = hyperliquid_user_stream.snapshot() if hyperliquid_user_stream is not None else None
         hyperliquid_address_bundle = merge_hyperliquid_address_bundle(base_hyperliquid_address_bundle, live_hyperliquid_bundle)
+    hyperliquid_spot_meta_payload: Dict[str, Any] = {}
+    hyperliquid_oi_cap_payload: Dict[str, Any] = {}
+    hyperliquid_spot_perp_context_frame = pd.DataFrame()
+    if active_view == "增强实验室" or (active_view == "首页总览" and overview_mode == "完整"):
+        hyperliquid_spot_meta_payload = load_hyperliquid_spot_meta_and_asset_contexts_cached(request_timeout)
+        hyperliquid_oi_cap_payload = load_hyperliquid_perps_at_oi_cap_cached(request_timeout)
+        hyperliquid_spot_perp_context_frame = build_hyperliquid_spot_perp_context_frame(
+            hyperliquid_spot_meta_payload,
+            snapshot_by_key.get("hyperliquid"),
+            selected_coin=symbol_map["hyperliquid"],
+            address_bundle=hyperliquid_address_bundle if hyperliquid_address_bundle else None,
+            oi_cap_payload=hyperliquid_oi_cap_payload,
+        )
     compare_coins = tuple(dict.fromkeys(cross_coin_pool))[:6]
     multi_coin_signature = (compare_coins, int(request_timeout), int(liquidation_limit))
     if active_view != "增强实验室" and compare_coins:
@@ -6944,7 +7326,7 @@ def render_terminal() -> None:
             f"lab-multi-coin::{base_coin}",
             multi_coin_signature,
             builder=lambda: load_market_overview_frame_cached(compare_coins, request_timeout, liquidation_limit),
-            max_age_seconds=max(60, refresh_seconds * 8),
+            max_age_seconds=prefetch_age,
         )
     watchlist_specs = build_hyperliquid_watchlist_specs(
         hyperliquid_address_value,
@@ -6985,7 +7367,7 @@ def render_terminal() -> None:
                 current_address=hyperliquid_address_value,
                 current_bundle=hyperliquid_address_bundle if hyperliquid_address_bundle else None,
             ),
-            max_age_seconds=max(60, refresh_seconds * 8),
+            max_age_seconds=prefetch_age,
         )
     prefetched_history_summary: Dict[str, Any] = {}
     history_index_days_prefetch = max(1, min(int(archive_retention_days), 7))
@@ -7002,7 +7384,7 @@ def render_terminal() -> None:
                 int(prefetched_history_summary.get("last_quality_ts") or 0),
             ),
             builder=lambda: build_history_index_payload(history_store, since_ms=history_index_since_ms_prefetch),
-            max_age_seconds=max(90, refresh_seconds * 12),
+            max_age_seconds=max(prefetch_age, 90),
         )
     selected_liquidation_truth = build_liquidation_truth_summary(
         liquidation_events,
@@ -7015,7 +7397,7 @@ def render_terminal() -> None:
         cross_exchange_cluster_frame = get_cached_derived_result(
             f"cross-liq-clusters::{base_coin}::{interval}",
             cross_liq_signature + (len(cross_exchange_session_liqs),),
-            ttl_seconds=max(4, refresh_seconds),
+            ttl_seconds=balanced_ttl,
             builder=lambda: build_liquidation_cluster_frame(cross_exchange_session_liqs, cluster_window_seconds=30, limit=16),
         )
     replay_events = sorted(perp_recorded_events + spot_recorded_events, key=lambda item: item.timestamp_ms)
@@ -7061,66 +7443,85 @@ def render_terminal() -> None:
         _orderbook_quality_confidence_score(perp_quality_history, str(selected_transport_health.get("sync_state") or ""))
     )
     selected_replay_confidence = _confidence_label(min(1.0, len(replay_events) / 36.0 if replay_events else 0.0))
-    spot_perp_decision_frame = build_spot_perp_decision_frame(
-        spot_exchange_frame,
-        lead_lag_frame,
-        contract_sentiment_frame,
-        perp_crowding_trio_frame,
-        funding_regime_frame,
-    )
-    propagation_snapshots = [snapshot_by_key[key] for key in perp_reference_exchange_keys if key in snapshot_by_key and snapshot_by_key[key].status == "ok"]
-    propagation_spread_frame = build_cross_exchange_spread_frame(propagation_snapshots) if propagation_snapshots else pd.DataFrame()
-    propagation_funding_arb_frame = build_funding_arb_frame(propagation_snapshots, limit=10) if propagation_snapshots else pd.DataFrame()
-    unified_signal_frame = build_unified_signal_frame(
-        spot_perp_decision_frame,
-        contract_sentiment_alert_frame,
-        confirmed_alert_frame,
-        share_dynamics_frame,
-        risk_buffer_frame,
-    )
-    execution_route_frame = build_execution_route_frame(
-        spot_execution_frame,
-        perp_execution_frame,
-        spot_perp_decision_frame,
-    )
-    propagation_frame = build_cross_exchange_propagation_frame(
-        spot_perp_decision_frame,
-        share_dynamics_frame,
-        propagation_spread_frame,
-        propagation_funding_arb_frame,
-        cross_exchange_cluster_frame,
-    )
+    spot_perp_decision_frame = pd.DataFrame()
+    propagation_spread_frame = pd.DataFrame()
+    propagation_funding_arb_frame = pd.DataFrame()
+    unified_signal_frame = pd.DataFrame()
+    execution_route_frame = pd.DataFrame()
+    propagation_frame = pd.DataFrame()
+    if need_home_full:
+        spot_perp_decision_frame = build_spot_perp_decision_frame(
+            spot_exchange_frame,
+            lead_lag_frame,
+            contract_sentiment_frame,
+            perp_crowding_trio_frame,
+            funding_regime_frame,
+        )
+        propagation_snapshots = [snapshot_by_key[key] for key in perp_reference_exchange_keys if key in snapshot_by_key and snapshot_by_key[key].status == "ok"]
+        propagation_spread_frame = build_cross_exchange_spread_frame(propagation_snapshots) if propagation_snapshots else pd.DataFrame()
+        propagation_funding_arb_frame = build_funding_arb_frame(propagation_snapshots, limit=10) if propagation_snapshots else pd.DataFrame()
+        unified_signal_frame = build_unified_signal_frame(
+            spot_perp_decision_frame,
+            contract_sentiment_alert_frame,
+            confirmed_alert_frame,
+            share_dynamics_frame,
+            risk_buffer_frame,
+        )
+        execution_route_frame = build_execution_route_frame(
+            spot_execution_frame,
+            perp_execution_frame,
+            spot_perp_decision_frame,
+        )
+        propagation_frame = build_cross_exchange_propagation_frame(
+            spot_perp_decision_frame,
+            share_dynamics_frame,
+            propagation_spread_frame,
+            propagation_funding_arb_frame,
+            cross_exchange_cluster_frame,
+        )
     if history_sqlite_enabled:
-        history_store.record_market_events(
-            base_coin,
-            {key: value for key, value in trade_events_by_exchange.items() if value},
-            category="trade",
-            exchange_title_map=EXCHANGE_TITLES,
-            market="perp",
+        schedule_history_write(
+            f"events::{base_coin}::trade",
+            lambda store=history_store, coin=base_coin, events={key: list(value) for key, value in trade_events_by_exchange.items() if value}: store.record_market_events(
+                coin,
+                events,
+                category="trade",
+                exchange_title_map=EXCHANGE_TITLES,
+                market="perp",
+            ),
         )
-        history_store.record_market_events(
-            base_coin,
-            {key: value for key, value in liquidation_events_by_exchange.items() if value},
-            category="liquidation",
-            exchange_title_map=EXCHANGE_TITLES,
-            market="perp",
+        schedule_history_write(
+            f"events::{base_coin}::liquidation",
+            lambda store=history_store, coin=base_coin, events={key: list(value) for key, value in liquidation_events_by_exchange.items() if value}: store.record_market_events(
+                coin,
+                events,
+                category="liquidation",
+                exchange_title_map=EXCHANGE_TITLES,
+                market="perp",
+            ),
         )
-        history_store.record_quality_points(
-            base_coin,
-            exchange_key=selected_exchange,
-            exchange_name=selected_snapshot.exchange,
-            symbol=selected_symbol,
-            points=perp_quality_history[-48:],
-            market="perp",
+        schedule_history_write(
+            f"quality::{base_coin}::{selected_exchange}::perp",
+            lambda store=history_store, coin=base_coin, exchange_key=selected_exchange, exchange_name=selected_snapshot.exchange, symbol=selected_symbol, points=list(perp_quality_history[-48:]): store.record_quality_points(
+                coin,
+                exchange_key=exchange_key,
+                exchange_name=exchange_name,
+                symbol=symbol,
+                points=points,
+                market="perp",
+            ),
         )
         if spot_symbol_map.get(selected_exchange) and spot_quality_history:
-            history_store.record_quality_points(
-                base_coin,
-                exchange_key=selected_exchange,
-                exchange_name=f"{selected_snapshot.exchange} Spot",
-                symbol=spot_symbol_map.get(selected_exchange, spot_symbol),
-                points=spot_quality_history[-48:],
-                market="spot",
+            schedule_history_write(
+                f"quality::{base_coin}::{selected_exchange}::spot",
+                lambda store=history_store, coin=base_coin, exchange_key=selected_exchange, exchange_name=f"{selected_snapshot.exchange} Spot", symbol=spot_symbol_map.get(selected_exchange, spot_symbol), points=list(spot_quality_history[-48:]): store.record_quality_points(
+                    coin,
+                    exchange_key=exchange_key,
+                    exchange_name=exchange_name,
+                    symbol=symbol,
+                    points=points,
+                    market="spot",
+                ),
             )
     browser_notifications = route_alert_notifications(
         new_alert_notifications,
@@ -7218,8 +7619,8 @@ def render_terminal() -> None:
             watchlist_bundles = get_stale_while_revalidate_result(
                 f"lab-watchlist::{base_coin}",
                 watch_signature,
-                ttl_seconds=20,
-                stale_ttl_seconds=max(120, refresh_seconds * 60),
+                ttl_seconds=heavy_ttl,
+                stale_ttl_seconds=stale_ttl,
                 builder=lambda: load_hyperliquid_watchlist_bundles(
                     watchlist_specs,
                     coin=symbol_map["hyperliquid"],
@@ -7284,8 +7685,8 @@ def render_terminal() -> None:
                     len(cross_exchange_session_liqs),
                     cross_exchange_session_liqs[-1].timestamp_ms if cross_exchange_session_liqs else 0,
                 ),
-                ttl_seconds=max(4, refresh_seconds),
-                stale_ttl_seconds=max(120, refresh_seconds * 20),
+                ttl_seconds=balanced_ttl,
+                stale_ttl_seconds=stale_ttl,
                 builder=lambda: {
                     "spread_frame": build_cross_exchange_spread_frame(lab_snapshots),
                     "funding_arb_frame": build_funding_arb_frame(lab_snapshots),
@@ -7317,8 +7718,8 @@ def render_terminal() -> None:
             multi_coin_frame = get_stale_while_revalidate_result(
                 f"lab-multi-coin::{base_coin}",
                 multi_coin_signature,
-                ttl_seconds=60,
-                stale_ttl_seconds=600,
+                ttl_seconds=max(60, heavy_ttl),
+                stale_ttl_seconds=max(600, stale_ttl),
                 builder=lambda: load_market_overview_frame_cached(compare_coins, request_timeout, liquidation_limit),
             )
             if multi_coin_frame is None:
@@ -7340,8 +7741,8 @@ def render_terminal() -> None:
                     float(crowd_account_ratio or 0.0),
                     float(global_ratio or 0.0),
                 ),
-                ttl_seconds=max(4, refresh_seconds),
-                stale_ttl_seconds=max(120, refresh_seconds * 20),
+                ttl_seconds=balanced_ttl,
+                stale_ttl_seconds=stale_ttl,
                 builder=lambda: {
                     "multifactor_frame": build_multifactor_sentiment_frame(
                         {key: snapshot_by_key[key] for key in lab_snapshot_keys if key in snapshot_by_key},
@@ -7376,8 +7777,8 @@ def render_terminal() -> None:
                     int(history_summary.get("last_event_ts") or 0),
                     int(history_summary.get("last_quality_ts") or 0),
                 ),
-                ttl_seconds=max(12, refresh_seconds * 3),
-                stale_ttl_seconds=max(120, refresh_seconds * 45),
+                ttl_seconds=max(12, heavy_ttl),
+                stale_ttl_seconds=max(stale_ttl, 150),
                 builder=lambda: build_history_review_payload(
                     history_store,
                     coin=base_coin,
@@ -7423,8 +7824,8 @@ def render_terminal() -> None:
             index_payload = get_stale_while_revalidate_result(
                 f"lab-history-index::{base_coin}",
                 index_signature,
-                ttl_seconds=max(20, refresh_seconds * 5),
-                stale_ttl_seconds=max(180, refresh_seconds * 60),
+                ttl_seconds=max(20, heavy_ttl),
+                stale_ttl_seconds=max(180, stale_ttl),
                 builder=lambda: build_history_index_payload(history_store, since_ms=history_index_since_ms),
             ) or {}
             history_index_alert_frame = index_payload.get("alert_frame", pd.DataFrame())
@@ -7490,6 +7891,66 @@ def render_terminal() -> None:
                             "8h等价费率(bps)": st.column_config.NumberColumn(format="%.3f"),
                             "年化费率(%)": st.column_config.NumberColumn(format="%.2f"),
                             "结算间隔(h)": st.column_config.NumberColumn(format="%.1f"),
+                        },
+                    )
+            render_section("Hyperliquid Spot / Perp 一体层", "把链上现货、永续、地址余额和 OI 上限占用放在同一层，避免只看单腿误判。")
+            hyper_context_display_frame = hyperliquid_spot_perp_context_frame.copy()
+            if not hyper_context_display_frame.empty and "时间" in hyper_context_display_frame.columns:
+                hyper_context_display_frame["时间"] = [format_display_timestamp_ms(value) for value in hyper_context_display_frame["时间"]]
+            hyper_context_cards = st.columns(4)
+            hyper_context_cards[0].metric("现货腿数", str(int(hyperliquid_spot_perp_context_frame["市场"].astype(str).eq("现货").sum()) if not hyperliquid_spot_perp_context_frame.empty else 0))
+            hyper_context_cards[1].metric("合约腿数", str(int(hyperliquid_spot_perp_context_frame["市场"].astype(str).eq("合约").sum()) if not hyperliquid_spot_perp_context_frame.empty else 0))
+            hyper_context_cards[2].metric(
+                "地址现货余额",
+                fmt_compact(
+                    payload_float(
+                        hyperliquid_spot_perp_context_frame.loc[
+                            hyperliquid_spot_perp_context_frame["市场"].astype(str).eq("现货"),
+                            "地址余额",
+                        ].dropna().sum()
+                    )
+                    if not hyperliquid_spot_perp_context_frame.empty
+                    else None
+                ),
+            )
+            hyper_context_cards[3].metric(
+                "OI 上限占用",
+                fmt_pct(
+                    hyperliquid_spot_perp_context_frame.loc[
+                        hyperliquid_spot_perp_context_frame["市场"].astype(str).eq("合约"),
+                        "OI上限占用(%)",
+                    ].max()
+                    if not hyperliquid_spot_perp_context_frame.empty
+                    else None
+                ),
+            )
+            hyper_context_left, hyper_context_right = st.columns([1.2, 1.05], gap="large")
+            with hyper_context_left:
+                st.plotly_chart(
+                    build_hyperliquid_spot_perp_context_figure(hyperliquid_spot_perp_context_frame),
+                    key=chart_key("lab-hl-spot-perp-context", base_coin, interval, lab_mode),
+                    config=PLOTLY_CONFIG,
+                )
+            with hyper_context_right:
+                if hyper_context_display_frame.empty:
+                    st.info("当前还没有足够的 Hyperliquid spot / perp 一体样本。")
+                else:
+                    st.dataframe(
+                        hyper_context_display_frame,
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "价格": st.column_config.NumberColumn(format="%.4f"),
+                            "24h成交额": st.column_config.NumberColumn(format="%.2f"),
+                            "Funding(bps)": st.column_config.NumberColumn(format="%.2f"),
+                            "Premium(%)": st.column_config.NumberColumn(format="%.3f"),
+                            "未平仓金额": st.column_config.NumberColumn(format="%.2f"),
+                            "地址余额": st.column_config.NumberColumn(format="%.4f"),
+                            "地址成本": st.column_config.NumberColumn(format="%.2f"),
+                            "地址持仓值": st.column_config.NumberColumn(format="%.2f"),
+                            "OI上限占用(%)": st.column_config.NumberColumn(format="%.2f"),
+                            "OI上限": st.column_config.NumberColumn(format="%.2f"),
+                            "全局OI上限": st.column_config.NumberColumn(format="%.2f"),
                         },
                     )
             watch_left, watch_right = st.columns([1.15, 1.25], gap="large")
@@ -8090,7 +8551,7 @@ def render_terminal() -> None:
                         int(history_summary.get("last_quality_ts") or 0),
                         int(history_summary.get("last_alert_ts") or 0),
                     ),
-                    ttl_seconds=max(20, refresh_seconds * 5),
+                    ttl_seconds=max(20, heavy_ttl),
                     builder=lambda: build_history_workbench_payload(
                         history_store,
                         coin=base_coin,
@@ -8755,7 +9216,11 @@ def render_terminal() -> None:
                 )
             st.caption("解释口径: `偏多推进 / 偏空推进` 更像趋势延续；`拥挤但衰竭 / 吸收中` 更像短线需要防冲高回落或杀跌回拉。")
 
-        render_section("已发生爆仓真值", "这里显示的是交易所公开接口已经确认发生的爆仓事件，不是模型推断区。")
+        render_section(
+            "已发生爆仓真值",
+            "这里显示的是交易所公开接口已经确认发生的爆仓事件，不是模型推断区。",
+            anchor_id="section-home-liquidation",
+        )
         st.caption(
             _join_caption_parts(
                 selected_trade_state,
@@ -9044,10 +9509,22 @@ def render_terminal() -> None:
                 liquidation_window_minutes=liquidation_window_minutes,
                 large_trade_frame=headline_large_trade_frame,
                 confirmed_alert_frame=confirmed_alert_frame,
+                kind_targets={
+                    "overview": "section-home-exchange-compare",
+                    "oi": "section-home-oi",
+                    "liquidation": "section-home-liquidation",
+                    "trade": "section-home-movers",
+                    "large": "section-home-large-perp",
+                    "alert": "section-home-movers",
+                },
                 limit=12,
             ),
         )
-        render_section("竞品级首页", "先看主结论、全市场总览板和异动榜，再决定要不要切到单币深度页。")
+        render_section(
+            "竞品级首页",
+            "先看主结论、全市场总览板和异动榜，再决定要不要切到单币深度页。",
+            anchor_id="section-home-hero",
+        )
         conclusion_cards = st.columns(4)
         conclusion_cards[0].metric("当前主结论", str(composite_signal.get("label") or "-"))
         conclusion_cards[1].metric("短线驱动", selected_lead_lag_summary or "样本不足")
@@ -9099,7 +9576,11 @@ def render_terminal() -> None:
                 },
             )
 
-        render_section("全市场总览板", "按币种把价格、OI、OI 1h/24h、Funding、爆仓样本、多空比、现货/合约成交比和 Lead/Lag 放在一张榜单里。")
+        render_section(
+            "全市场总览板",
+            "按币种把价格、OI、OI 1h/24h、Funding、爆仓样本、多空比、现货/合约成交比和 Lead/Lag 放在一张榜单里。",
+            anchor_id="section-home-overview",
+        )
         if overview_frame.empty:
             st.info("当前首页币种池还没有可展示的数据。")
         else:
@@ -9121,7 +9602,11 @@ def render_terminal() -> None:
             )
             st.caption("这里的 `24h爆仓样本额` 目前基于公开接口可回拉到的爆仓样本，不等于全市场完整 24h 真值。")
 
-        render_section("异动榜", "把 OI 激增、爆仓放大、Funding 极值、合约情绪极值、现货先动、拥挤但衰竭 这六类异动拆开看。")
+        render_section(
+            "异动榜",
+            "把 OI 激增、爆仓放大、Funding 极值、合约情绪极值、现货先动、拥挤但衰竭 这六类异动拆开看。",
+            anchor_id="section-home-movers",
+        )
         oi_movers = build_movers_frame(overview_frame, "OI 1h(%)", limit=5, ascending=False)
         liq_movers = build_movers_frame(overview_frame, "24h爆仓样本额", limit=5, ascending=False)
         funding_movers = (
@@ -9166,7 +9651,11 @@ def render_terminal() -> None:
                     display_columns = ["币种", "主结论", focus_column]
                     st.dataframe(frame[display_columns], width="stretch", hide_index=True)
 
-        render_section("全市场对比" if exchange_scope_mode == "全部交易所" else "当前交易所对比", "横向比较价格、持仓、费率和成交额。")
+        render_section(
+            "全市场对比" if exchange_scope_mode == "全部交易所" else "当前交易所对比",
+            "横向比较价格、持仓、费率和成交额。",
+            anchor_id="section-home-exchange-compare",
+        )
         st.dataframe(build_snapshot_frame(scope_snapshots if exchange_scope_mode == "当前交易所优先" else snapshots), width="stretch", hide_index=True)
         market_board_mode = render_choice_bar(
             "首页看板视角",
@@ -9179,7 +9668,11 @@ def render_terminal() -> None:
         perp_dashboard_frame = build_perp_dashboard_frame(snapshot_by_key, perp_summary_map, oi_metrics_by_exchange, contract_ratio_by_exchange, exchange_keys=scope_perp_keys)
 
         if market_board_mode in ("综合看板", "合约看板"):
-            render_section("持仓总量 / 未平仓对比", "公开 API 下，这里的未平仓就是合约 OI；现货市场不存在 OI 概念。")
+            render_section(
+                "持仓总量 / 未平仓对比",
+                "公开 API 下，这里的未平仓就是合约 OI；现货市场不存在 OI 概念。",
+                anchor_id="section-home-oi",
+            )
             oi_left, oi_right = st.columns([1.6, 1.35], gap="large")
             with oi_left:
                 st.plotly_chart(
@@ -9440,7 +9933,7 @@ def render_terminal() -> None:
                     round(float(risk_heat_window_pct), 2),
                     int(risk_heat_buckets),
                 ),
-                ttl_seconds=max(4, refresh_seconds),
+                ttl_seconds=balanced_ttl,
                 builder=lambda: {
                     "heatmap_frame": build_event_heatmap_frame(
                         {EXCHANGE_TITLES[key]: spot_trades_map.get(key, []) for key in scope_spot_keys},
@@ -9560,6 +10053,9 @@ def render_terminal() -> None:
                         "主动买占比(%)": st.column_config.NumberColumn(format="%.2f"),
                         "价差(bps)": st.column_config.NumberColumn(format="%.2f"),
                         "盘口失衡(%)": st.column_config.NumberColumn(format="%.2f"),
+                        "可见深度": st.column_config.NumberColumn(format="%.2f"),
+                        "报价漂移(bps)": st.column_config.NumberColumn(format="%.2f"),
+                        "报价波动(bps)": st.column_config.NumberColumn(format="%.2f"),
                         "50k冲击(bps)": st.column_config.NumberColumn(format="%.2f"),
                         "250k冲击(bps)": st.column_config.NumberColumn(format="%.2f"),
                         "50k填充率(%)": st.column_config.NumberColumn(format="%.1f"),
@@ -9583,7 +10079,12 @@ def render_terminal() -> None:
                             "250k冲击(bps)": st.column_config.NumberColumn(format="%.2f"),
                             "50k填充率(%)": st.column_config.NumberColumn(format="%.1f"),
                             "250k填充率(%)": st.column_config.NumberColumn(format="%.1f"),
+                            "近价新增额": st.column_config.NumberColumn(format="%.2f"),
+                            "近价撤单额": st.column_config.NumberColumn(format="%.2f"),
+                            "近价净变化": st.column_config.NumberColumn(format="%.2f"),
                             "近价撤补比": st.column_config.NumberColumn(format="%.2f"),
+                            "报价漂移(bps)": st.column_config.NumberColumn(format="%.2f"),
+                            "报价波动(bps)": st.column_config.NumberColumn(format="%.2f"),
                         },
                     )
             st.caption("现货参考层 = 净主动流 + 执行质量，不会把合约的 OI、Funding、多空人数硬套到现货上。")
@@ -9659,11 +10160,69 @@ def render_terminal() -> None:
             key_scope=chart_key("carry-home", base_coin, exchange_scope_mode, interval),
         )
 
+        render_section("Hyperliquid Spot / Perp 一体层", "把 Hyperliquid 现货、永续、地址库存和 OI 上限占用放到同一层，方便直接看链上现货和合约是否同向。")
+        hyperliquid_context_display_frame = hyperliquid_spot_perp_context_frame.copy()
+        if not hyperliquid_context_display_frame.empty and "时间" in hyperliquid_context_display_frame.columns:
+            hyperliquid_context_display_frame["时间"] = [format_display_timestamp_ms(value) for value in hyperliquid_context_display_frame["时间"]]
+        hyper_unified_cards = st.columns(4)
+        hyper_unified_cards[0].metric("现货腿数", str(int(hyperliquid_spot_perp_context_frame["市场"].astype(str).eq("现货").sum()) if not hyperliquid_spot_perp_context_frame.empty else 0))
+        hyper_unified_cards[1].metric("永续腿数", str(int(hyperliquid_spot_perp_context_frame["市场"].astype(str).eq("合约").sum()) if not hyperliquid_spot_perp_context_frame.empty else 0))
+        hyper_unified_cards[2].metric(
+            "地址持仓值",
+            fmt_compact(
+                payload_float(
+                    hyperliquid_spot_perp_context_frame["地址持仓值"].dropna().sum()
+                    if not hyperliquid_spot_perp_context_frame.empty and "地址持仓值" in hyperliquid_spot_perp_context_frame.columns
+                    else None
+                )
+            ),
+        )
+        hyper_unified_cards[3].metric(
+            "最高 OI 上限占用",
+            fmt_pct(
+                hyperliquid_spot_perp_context_frame.loc[
+                    hyperliquid_spot_perp_context_frame["市场"].astype(str).eq("合约"),
+                    "OI上限占用(%)",
+                ].max()
+                if not hyperliquid_spot_perp_context_frame.empty
+                else None
+            ),
+        )
+        hyper_unified_left, hyper_unified_right = st.columns([1.18, 1.02], gap="large")
+        with hyper_unified_left:
+            st.plotly_chart(
+                build_hyperliquid_spot_perp_context_figure(hyperliquid_spot_perp_context_frame),
+                key=chart_key("home-hl-spot-perp-context", base_coin, interval, exchange_scope_mode),
+                config=PLOTLY_CONFIG,
+            )
+        with hyper_unified_right:
+            if hyperliquid_context_display_frame.empty:
+                st.info("当前没有足够的 Hyperliquid spot / perp 一体样本。")
+            else:
+                st.dataframe(
+                    hyperliquid_context_display_frame,
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "价格": st.column_config.NumberColumn(format="%.4f"),
+                        "24h成交额": st.column_config.NumberColumn(format="%.2f"),
+                        "Funding(bps)": st.column_config.NumberColumn(format="%.2f"),
+                        "Premium(%)": st.column_config.NumberColumn(format="%.3f"),
+                        "未平仓金额": st.column_config.NumberColumn(format="%.2f"),
+                        "地址余额": st.column_config.NumberColumn(format="%.4f"),
+                        "地址成本": st.column_config.NumberColumn(format="%.2f"),
+                        "地址持仓值": st.column_config.NumberColumn(format="%.2f"),
+                        "OI上限占用(%)": st.column_config.NumberColumn(format="%.2f"),
+                        "OI上限": st.column_config.NumberColumn(format="%.2f"),
+                        "全局OI上限": st.column_config.NumberColumn(format="%.2f"),
+                    },
+                )
+
         contract_sentiment_display_frame = contract_sentiment_frame.copy()
         if not contract_sentiment_display_frame.empty and "时间" in contract_sentiment_display_frame.columns:
             contract_sentiment_display_frame["时间"] = [format_display_timestamp_ms(value) for value in contract_sentiment_display_frame["时间"]]
         render_section("合约情绪真值层", "公开多空比当前只对 Binance / Bybit 可用；OKX / Hyperliquid 先展示 OI、Funding 和主动流代理，不和现货口径混在一起。")
-        sentiment_row = st.columns(4)
+        sentiment_row = st.columns(5)
         available_ratio_frame = contract_sentiment_frame.dropna(subset=["合约多空比"]) if not contract_sentiment_frame.empty and "合约多空比" in contract_sentiment_frame.columns else pd.DataFrame()
         strongest_long_row = (
             available_ratio_frame.sort_values("合约多空比", ascending=False).iloc[0]
@@ -9682,6 +10241,11 @@ def render_terminal() -> None:
             if not contract_sentiment_frame.empty and "主动流买占比(%)" in contract_sentiment_frame.columns
             else {}
         )
+        strongest_resonance_row = (
+            contract_sentiment_frame.sort_values("共振评分", ascending=False, na_position="last").iloc[0]
+            if not contract_sentiment_frame.empty and "共振评分" in contract_sentiment_frame.columns
+            else {}
+        )
         sentiment_row[0].metric("公开多空比所数", str(int(contract_sentiment_frame["合约多空比"].notna().sum()) if not contract_sentiment_frame.empty else 0))
         sentiment_row[1].metric(
             "偏多最强",
@@ -9697,6 +10261,15 @@ def render_terminal() -> None:
             "主动流最偏单边",
             str(active_flow_row.get("交易所") or "-") if isinstance(active_flow_row, pd.Series) else "-",
             "-" if not isinstance(active_flow_row, pd.Series) else fmt_pct(active_flow_row.get("主动流买占比(%)")),
+        )
+        sentiment_row[4].metric(
+            "最强共振",
+            str(strongest_resonance_row.get("交易所") or "-") if isinstance(strongest_resonance_row, pd.Series) else "-",
+            "-"
+            if not isinstance(strongest_resonance_row, pd.Series)
+            else (
+                f"{float(strongest_resonance_row.get('共振评分') or 0.0):.1f} · {str(strongest_resonance_row.get('真值层级') or '-')}"
+            ),
         )
         sentiment_left, sentiment_right = st.columns([1.05, 1.15], gap="large")
         with sentiment_left:
@@ -9724,9 +10297,15 @@ def render_terminal() -> None:
                     "OI份额(%)": st.column_config.ProgressColumn(format="%.2f", min_value=0.0, max_value=100.0),
                     "资金费率(bps)": st.column_config.NumberColumn(format="%.2f"),
                     "合约多空比": st.column_config.NumberColumn(format="%.3f"),
+                    "大户持仓多空比": st.column_config.NumberColumn(format="%.3f"),
+                    "大户账户多空比": st.column_config.NumberColumn(format="%.3f"),
+                    "全市场账户多空比": st.column_config.NumberColumn(format="%.3f"),
                     "账户多头占比(%)": st.column_config.NumberColumn(format="%.2f"),
                     "账户空头占比(%)": st.column_config.NumberColumn(format="%.2f"),
                     "主动流买占比(%)": st.column_config.NumberColumn(format="%.2f"),
+                    "主动买卖比": st.column_config.NumberColumn(format="%.2f"),
+                    "共振评分": st.column_config.NumberColumn(format="%.1f"),
+                    "真值层级": st.column_config.TextColumn(),
                 },
             )
         sentiment_alert_left, sentiment_alert_right = st.columns([1.2, 1.0], gap="large")
@@ -9752,7 +10331,7 @@ def render_terminal() -> None:
             st.caption("这一栏现在会同时扫描 Binance + Bybit 的公开多空比；OKX / Hyperliquid 仍然只做代理观察，不会冒充真值。")
             st.markdown(
                 "- `高`：多空比与 funding 同向共振，或者多空比极值明显。\n"
-                "- `中`：单边主动流明显偏斜，或者多空比轻度偏单边。\n"
+                "- `中`：单边主动流、主动买卖比或共振评分明显偏斜。\n"
                 "- `观察`：当前只有代理口径，先做风险提示，不当成真拥挤。"
             )
 
@@ -9846,9 +10425,12 @@ def render_terminal() -> None:
                             "价格": st.column_config.NumberColumn(format="%.2f"),
                             "Premium(%)": st.column_config.NumberColumn(format="%.3f"),
                             "Basis(%)": st.column_config.NumberColumn(format="%.3f"),
+                            "基差率(%)": st.column_config.NumberColumn(format="%.3f"),
                             "Funding(bps)": st.column_config.NumberColumn(format="%.2f"),
                             "下一次Funding(bps)": st.column_config.NumberColumn(format="%.2f"),
                             "Funding带宽(bps)": st.column_config.NumberColumn(format="%.2f"),
+                            "Carry状态": st.column_config.TextColumn(),
+                            "距下次Funding(min)": st.column_config.NumberColumn(format="%.1f"),
                         },
                     )
             with funding_detail_right:
@@ -9868,7 +10450,12 @@ def render_terminal() -> None:
                             "250k冲击(bps)": st.column_config.NumberColumn(format="%.2f"),
                             "50k填充率(%)": st.column_config.NumberColumn(format="%.1f"),
                             "250k填充率(%)": st.column_config.NumberColumn(format="%.1f"),
+                            "近价新增额": st.column_config.NumberColumn(format="%.2f"),
+                            "近价撤单额": st.column_config.NumberColumn(format="%.2f"),
+                            "近价净变化": st.column_config.NumberColumn(format="%.2f"),
                             "近价撤补比": st.column_config.NumberColumn(format="%.2f"),
+                            "报价漂移(bps)": st.column_config.NumberColumn(format="%.2f"),
+                            "报价波动(bps)": st.column_config.NumberColumn(format="%.2f"),
                         },
                     )
 
@@ -9991,7 +10578,7 @@ def render_terminal() -> None:
                 round(float(risk_heat_window_pct), 2),
                 int(risk_heat_buckets),
             ),
-            ttl_seconds=max(4, refresh_seconds),
+            ttl_seconds=balanced_ttl,
             builder=lambda: {
                 "trade_heatmap_frame": build_event_heatmap_frame(
                     {EXCHANGE_TITLES[key]: trade_events_by_exchange.get(key, []) for key in scope_perp_keys},
@@ -10023,7 +10610,11 @@ def render_terminal() -> None:
         perp_large_trade_heatmap_frame = contract_heatmap_payload.get("trade_heatmap_frame", pd.DataFrame())
         perp_liquidation_heatmap_frame = contract_heatmap_payload.get("liquidation_heatmap_frame", pd.DataFrame())
         perp_large_trade_frame = contract_heatmap_payload.get("large_trade_frame", pd.DataFrame())
-        render_section("合约大额热力图 / 清算热力图 2.0", "把合约大额主动成交和真实清算流分开画；绿色更偏 short squeeze / 主动买，红色更偏 long flush / 主动卖。")
+        render_section(
+            "合约大额热力图 / 清算热力图 2.0",
+            "把合约大额主动成交和真实清算流分开画；绿色更偏 short squeeze / 主动买，红色更偏 long flush / 主动卖。",
+            anchor_id="section-home-large-perp",
+        )
         contract_heat_row = st.columns(4)
         contract_heat_row[0].metric("合约大额样本额", fmt_compact(perp_large_trade_heatmap_frame["总名义金额"].sum() if not perp_large_trade_heatmap_frame.empty else None))
         contract_heat_row[1].metric("清算样本额", fmt_compact(perp_liquidation_heatmap_frame["总名义金额"].sum() if not perp_liquidation_heatmap_frame.empty else None))
@@ -10072,11 +10663,25 @@ def render_terminal() -> None:
             window_minutes=max(10, liquidation_window_minutes),
         )
         render_section("真实清算流 / 推断爆仓带", "真实清算流只统计已发生事件；推断爆仓带是按价格带聚合的高风险区域，两者分开看才不会混淆真值和推断。")
-        liq_truth_cards = st.columns(4)
+        liq_truth_cards = st.columns(6)
         liq_truth_cards[0].metric("真实清算样本额", fmt_compact(liquidation_truth_inference_frame["真实清算额"].sum() if not liquidation_truth_inference_frame.empty else None))
         liq_truth_cards[1].metric("推断热力总额", fmt_compact(liquidation_truth_inference_frame["推断热力额"].sum() if not liquidation_truth_inference_frame.empty else None))
         liq_truth_cards[2].metric("真实事件数", str(int(liquidation_truth_inference_frame["真实事件数"].sum()) if not liquidation_truth_inference_frame.empty else 0))
         liq_truth_cards[3].metric("推断价带数", str(int(liquidation_truth_inference_frame["推断价带数"].sum()) if not liquidation_truth_inference_frame.empty else 0))
+        liq_truth_cards[4].metric(
+            "高覆盖所数",
+            str(int(liquidation_truth_inference_frame["覆盖等级"].astype(str).eq("高").sum()) if not liquidation_truth_inference_frame.empty else 0),
+        )
+        liq_truth_cards[5].metric(
+            "中高置信所数",
+            str(
+                int(
+                    liquidation_truth_inference_frame["真值置信度"].astype(str).isin(["高", "中"]).sum()
+                )
+                if not liquidation_truth_inference_frame.empty
+                else 0
+            ),
+        )
         liq_truth_left, liq_truth_right = st.columns([1.2, 1.0], gap="large")
         with liq_truth_left:
             st.plotly_chart(
@@ -10097,9 +10702,13 @@ def render_terminal() -> None:
                         "真实事件数": st.column_config.NumberColumn(format="%d"),
                         "推断热力额": st.column_config.NumberColumn(format="%.2f"),
                         "推断价带数": st.column_config.NumberColumn(format="%d"),
+                        "覆盖等级": st.column_config.TextColumn(),
+                        "Tape口径": st.column_config.TextColumn(),
+                        "采样说明": st.column_config.TextColumn(width="medium"),
+                        "真值置信度": st.column_config.TextColumn(),
                     },
                 )
-        st.caption("真实清算来自公开 liquidation 流；推断爆仓带来自价格带热力聚合。前者看已发生，后者看潜在高风险区。")
+        st.caption("真实清算来自公开 liquidation 流；推断爆仓带来自价格带热力聚合。前者看已发生，后者看潜在高风险区；不同交易所的 tape 覆盖等级并不相同。")
 
         render_section("风险缓冲 / 跨所份额动态", "风险缓冲层看 Funding、Premium、OI/成交比、保险池和冲击价差；份额动态层看 OI、合约成交、现货成交三条份额线谁在扩张。")
         risk_share_left, risk_share_right = st.columns([1.05, 1.15], gap="large")
