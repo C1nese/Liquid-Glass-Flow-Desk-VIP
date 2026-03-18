@@ -336,23 +336,3 @@ streamlit run app.py
 - `Telegram Chat ID`
 
 这些凭据只保存在本地偏好文件里，不会上传到别处。
-## License
-
-All rights reserved.
-
-This project is proprietary and is provided for viewing and evaluation only.
-No part of this repository may be copied, modified, distributed, sublicensed, sold, or used for commercial purposes without prior written permission from the author.
-
-If you need a commercial license, please contact me.
-## 授权说明
-
-本项目及其全部代码、设计和内容版权归作者所有，保留所有权利。
-
-未经作者事先书面许可，任何人不得对本项目进行：
-- 商业使用
-- 复制分发
-- 修改后发布
-- 二次售卖
-- 集成到付费产品或服务中
-
-如需商业授权，请联系作者。
