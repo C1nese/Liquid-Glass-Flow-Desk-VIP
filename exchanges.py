@@ -1,7 +1,8 @@
 ﻿from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import time
+import threading
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -84,6 +85,26 @@ BYBIT_RATIO_INTERVALS = {
     "1h": "1h",
     "4h": "4h",
     "1d": "1d",
+}
+
+EXCHANGE_TITLE_MAP = {
+    "binance": "Binance",
+    "bybit": "Bybit",
+    "okx": "OKX",
+    "hyperliquid": "Hyperliquid",
+}
+
+_REQUEST_HEALTH_LOCK = threading.Lock()
+_REQUEST_HEALTH: Dict[str, Dict[str, Any]] = {}
+_REQUEST_COOLDOWN_SECONDS = {
+    "legal": 180,
+    "forbidden": 90,
+    "rate_limit": 45,
+    "timeout": 20,
+    "transport": 25,
+    "server": 18,
+    "http": 30,
+    "other": 15,
 }
 
 
@@ -360,6 +381,165 @@ def normalize_trade_side(value: Optional[object]) -> str:
     return text or "unknown"
 
 
+def _request_health_key(exchange_name: str) -> Tuple[str, str, str]:
+    normalized_name = str(exchange_name or "").strip()
+    lower_name = normalized_name.lower()
+    market = "spot" if "spot" in lower_name else "perp"
+    if "binance" in lower_name:
+        exchange_key = "binance"
+    elif "bybit" in lower_name:
+        exchange_key = "bybit"
+    elif "okx" in lower_name:
+        exchange_key = "okx"
+    elif "hyperliquid" in lower_name:
+        exchange_key = "hyperliquid"
+    else:
+        exchange_key = lower_name.replace(" ", "-") or "unknown"
+    display_name = EXCHANGE_TITLE_MAP.get(exchange_key, normalized_name or exchange_key.title())
+    return exchange_key, market, display_name
+
+
+def _request_health_defaults(exchange_name: str) -> Dict[str, Any]:
+    exchange_key, market, display_name = _request_health_key(exchange_name)
+    return {
+        "exchange_key": exchange_key,
+        "exchange_name": display_name,
+        "market": market,
+        "last_success_ms": None,
+        "last_attempt_ms": None,
+        "last_error_ms": None,
+        "last_error": None,
+        "last_status_code": None,
+        "error_kind": None,
+        "consecutive_failures": 0,
+        "cooldown_until_ms": None,
+        "status": "idle",
+    }
+
+
+def _classify_request_error(exc: Exception) -> Tuple[Optional[int], str]:
+    status_code = None
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        status_code = int(exc.response.status_code)
+    elif getattr(exc, "response", None) is not None and getattr(exc.response, "status_code", None) is not None:
+        try:
+            status_code = int(exc.response.status_code)
+        except (TypeError, ValueError):
+            status_code = None
+    if status_code == 451:
+        return status_code, "legal"
+    if status_code == 403:
+        return status_code, "forbidden"
+    if status_code in (418, 429):
+        return status_code, "rate_limit"
+    if status_code is not None and status_code >= 500:
+        return status_code, "server"
+    if status_code is not None:
+        return status_code, "http"
+    if isinstance(exc, requests.Timeout):
+        return None, "timeout"
+    if isinstance(exc, requests.RequestException):
+        return None, "transport"
+    return None, "other"
+
+
+def _current_cooldown_remaining_ms(exchange_name: str) -> int:
+    exchange_key, market, _ = _request_health_key(exchange_name)
+    cache_key = f"{exchange_key}:{market}"
+    now_ms = int(time.time() * 1000)
+    with _REQUEST_HEALTH_LOCK:
+        entry = _REQUEST_HEALTH.get(cache_key)
+        cooldown_until_ms = int(entry.get("cooldown_until_ms") or 0) if entry else 0
+    return max(0, cooldown_until_ms - now_ms)
+
+
+def _record_request_success(exchange_name: str) -> None:
+    exchange_key, market, display_name = _request_health_key(exchange_name)
+    cache_key = f"{exchange_key}:{market}"
+    now_ms = int(time.time() * 1000)
+    with _REQUEST_HEALTH_LOCK:
+        entry = dict(_REQUEST_HEALTH.get(cache_key) or _request_health_defaults(exchange_name))
+        entry.update(
+            {
+                "exchange_key": exchange_key,
+                "exchange_name": display_name,
+                "market": market,
+                "last_success_ms": now_ms,
+                "last_attempt_ms": now_ms,
+                "consecutive_failures": 0,
+                "cooldown_until_ms": None,
+                "status": "ok",
+            }
+        )
+        _REQUEST_HEALTH[cache_key] = entry
+
+
+def _record_request_failure(exchange_name: str, exc: Exception) -> None:
+    exchange_key, market, display_name = _request_health_key(exchange_name)
+    cache_key = f"{exchange_key}:{market}"
+    now_ms = int(time.time() * 1000)
+    status_code, error_kind = _classify_request_error(exc)
+    cooldown_seconds = int(_REQUEST_COOLDOWN_SECONDS.get(error_kind, _REQUEST_COOLDOWN_SECONDS["other"]))
+    with _REQUEST_HEALTH_LOCK:
+        entry = dict(_REQUEST_HEALTH.get(cache_key) or _request_health_defaults(exchange_name))
+        consecutive_failures = int(entry.get("consecutive_failures") or 0) + 1
+        should_cooldown = error_kind in {"legal", "forbidden", "rate_limit"} or consecutive_failures >= 2
+        cooldown_until_ms = now_ms + cooldown_seconds * 1000 if should_cooldown else None
+        entry.update(
+            {
+                "exchange_key": exchange_key,
+                "exchange_name": display_name,
+                "market": market,
+                "last_attempt_ms": now_ms,
+                "last_error_ms": now_ms,
+                "last_error": str(exc),
+                "last_status_code": status_code,
+                "error_kind": error_kind,
+                "consecutive_failures": consecutive_failures,
+                "cooldown_until_ms": cooldown_until_ms,
+                "status": "error",
+            }
+        )
+        _REQUEST_HEALTH[cache_key] = entry
+
+
+def describe_exchange_request_health() -> List[Dict[str, Any]]:
+    now_ms = int(time.time() * 1000)
+    rows: List[Dict[str, Any]] = []
+    market_matrix = {
+        "binance": ("perp", "spot"),
+        "bybit": ("perp", "spot"),
+        "okx": ("perp", "spot"),
+        "hyperliquid": ("perp",),
+    }
+    with _REQUEST_HEALTH_LOCK:
+        snapshot = {key: dict(value) for key, value in _REQUEST_HEALTH.items()}
+    for exchange_key in EXCHANGE_ORDER:
+        for market in market_matrix.get(exchange_key, ("perp",)):
+            cache_key = f"{exchange_key}:{market}"
+            entry = snapshot.get(cache_key, {})
+            display_name = EXCHANGE_TITLE_MAP.get(exchange_key, exchange_key.title())
+            cooldown_until_ms = int(entry.get("cooldown_until_ms") or 0)
+            rows.append(
+                {
+                    "exchange_key": exchange_key,
+                    "exchange_name": display_name,
+                    "market": market,
+                    "last_success_ms": entry.get("last_success_ms"),
+                    "last_attempt_ms": entry.get("last_attempt_ms"),
+                    "last_error_ms": entry.get("last_error_ms"),
+                    "last_error": entry.get("last_error"),
+                    "last_status_code": entry.get("last_status_code"),
+                    "error_kind": entry.get("error_kind"),
+                    "consecutive_failures": int(entry.get("consecutive_failures") or 0),
+                    "cooldown_until_ms": cooldown_until_ms or None,
+                    "cooldown_remaining_s": max(0, int((cooldown_until_ms - now_ms + 999) // 1000)) if cooldown_until_ms else 0,
+                    "status": entry.get("status") or "idle",
+                }
+            )
+    return rows
+
+
 class BaseClient:
     exchange_name = "Unknown"
     base_url = ""
@@ -381,15 +561,25 @@ class BaseClient:
         self.session.mount("http://", adapter)
 
     def _request(self, method: str, path: str, *, params=None, json=None):
-        response = self.session.request(
-            method,
-            self.base_url + path,
-            params=params,
-            json=json,
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-        return response.json()
+        cooldown_remaining_ms = _current_cooldown_remaining_ms(self.exchange_name)
+        if cooldown_remaining_ms > 0:
+            remaining_seconds = max(1, int((cooldown_remaining_ms + 999) // 1000))
+            raise RuntimeError(f"{self.exchange_name} REST 冷却中，{remaining_seconds}s 后自动重试")
+        try:
+            response = self.session.request(
+                method,
+                self.base_url + path,
+                params=params,
+                json=json,
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:
+            _record_request_failure(self.exchange_name, exc)
+            raise
+        _record_request_success(self.exchange_name)
+        return payload
 
     def fetch(self, symbol: str) -> ExchangeSnapshot:
         raise NotImplementedError

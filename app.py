@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from dataclasses import asdict
+from html import escape as html_escape
 import math
 import time
 import json
@@ -136,6 +137,7 @@ from exchanges import (
     fetch_spot_trades,
     interval_to_millis,
     is_valid_onchain_address,
+    describe_exchange_request_health,
 )
 from models import Candle, ExchangeSnapshot, LiquidationEvent, OIPoint, OrderBookLevel, SpotSnapshot, TradeEvent
 from realtime import LiveTerminalService
@@ -355,6 +357,92 @@ st.markdown(
         box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
         backdrop-filter: blur(18px);
         transition: background 220ms ease, border-color 220ms ease, transform 220ms ease;
+    }
+    .headline-marquee-shell {
+        display: flex;
+        align-items: center;
+        gap: 0.9rem;
+        padding: 0.86rem 1rem;
+        margin: -0.18rem 0 0.9rem;
+        border-radius: 24px;
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        background: linear-gradient(135deg, rgba(255, 255, 255, 0.11), rgba(255, 255, 255, 0.05));
+        box-shadow: var(--glass-shadow);
+        backdrop-filter: blur(24px);
+        overflow: hidden;
+    }
+    .headline-marquee-label {
+        flex: 0 0 auto;
+        padding: 0.46rem 0.8rem;
+        border-radius: 999px;
+        background: rgba(255, 129, 98, 0.2);
+        border: 1px solid rgba(255, 169, 142, 0.32);
+        color: #fff4ef;
+        font-size: 0.76rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        white-space: nowrap;
+    }
+    .headline-marquee-viewport {
+        position: relative;
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        mask-image: linear-gradient(90deg, transparent 0%, rgba(0, 0, 0, 1) 6%, rgba(0, 0, 0, 1) 94%, transparent 100%);
+    }
+    .headline-marquee-track {
+        display: flex;
+        align-items: center;
+        width: max-content;
+        animation: headline-marquee-scroll 38s linear infinite;
+        will-change: transform;
+    }
+    .headline-marquee-group {
+        display: flex;
+        align-items: center;
+        gap: 0.72rem;
+        padding-right: 0.72rem;
+        white-space: nowrap;
+    }
+    .headline-marquee-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.48rem;
+        padding: 0.48rem 0.88rem;
+        border-radius: 999px;
+        background: rgba(10, 19, 31, 0.4);
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        color: #eff5ff;
+        font-size: 0.9rem;
+        line-height: 1.25;
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    }
+    .headline-marquee-chip::before {
+        content: "";
+        width: 0.45rem;
+        height: 0.45rem;
+        border-radius: 50%;
+        background: linear-gradient(180deg, #9fe5ff, #ffbf8f);
+        box-shadow: 0 0 16px rgba(159, 229, 255, 0.48);
+        flex: 0 0 auto;
+    }
+    @keyframes headline-marquee-scroll {
+        from {
+            transform: translateX(0);
+        }
+        to {
+            transform: translateX(-50%);
+        }
+    }
+    @media (prefers-reduced-motion: reduce) {
+        .headline-marquee-track {
+            animation: none;
+        }
+        .headline-marquee-viewport {
+            overflow-x: auto;
+            mask-image: none;
+        }
     }
     .glass-section {
         margin: 1.1rem 0 0.72rem;
@@ -2497,7 +2585,14 @@ def _subset_existing_columns(frame: pd.DataFrame, columns: List[str]) -> pd.Data
 
 
 def _concat_non_empty_frames(frames: List[pd.DataFrame]) -> pd.DataFrame:
-    valid_frames = [frame for frame in frames if not frame.empty]
+    valid_frames: List[pd.DataFrame] = []
+    for frame in frames:
+        if frame.empty:
+            continue
+        cleaned = frame.dropna(axis=1, how="all").copy()
+        if cleaned.empty or cleaned.shape[1] == 0:
+            continue
+        valid_frames.append(cleaned)
     if not valid_frames:
         return pd.DataFrame()
     return pd.concat(valid_frames, ignore_index=True, sort=False)
@@ -2564,6 +2659,962 @@ def build_history_index_payload(history_store: Any, *, since_ms: int) -> Dict[st
         "event_frame": history_store.load_market_events(since_ms=since_ms, limit=5000),
         "quality_frame": quality_frame,
     }
+
+
+def _confidence_score_from_label(label: Any) -> float:
+    label_text = str(label or "").strip()
+    if label_text == "高置信":
+        return 0.82
+    if label_text == "中置信":
+        return 0.56
+    if label_text == "低置信":
+        return 0.24
+    return 0.0
+
+
+def _transport_health_state_label(health: Dict[str, Any], *, available: bool, market: str) -> str:
+    if not available:
+        return "未上架/未命中"
+    sync_state = str(health.get("sync_state") or health.get("stream_status") or "").strip().lower()
+    if market == "spot" and health.get("status") == "unsupported":
+        return "未接入"
+    if sync_state in {"synced", "live"}:
+        ts_ms = int(payload_float(health.get("last_message_ms")) or 0) or int(payload_float(health.get("snapshot_timestamp_ms")) or 0) or int(payload_float(health.get("last_snapshot_ms")) or 0)
+        return _join_caption_parts("在线", _format_latency(ts_ms))
+    if sync_state == "bootstrapping":
+        return "回补中"
+    if sync_state in {"connecting", "reconnecting"}:
+        return "重连中"
+    if sync_state == "degraded":
+        return "待修复"
+    error_text = str(health.get("error") or "").strip()
+    if error_text:
+        return error_text[:48]
+    ts_ms = int(payload_float(health.get("last_message_ms")) or 0) or int(payload_float(health.get("snapshot_timestamp_ms")) or 0) or int(payload_float(health.get("last_snapshot_ms")) or 0)
+    if ts_ms:
+        return _format_latency(ts_ms)
+    return "待采样"
+
+
+def _request_health_state_label(row: Dict[str, Any], *, available: bool, current_status: str | None = None) -> str:
+    if not available:
+        return "未上架/未命中"
+    cooldown_seconds = int(row.get("cooldown_remaining_s") or 0)
+    if cooldown_seconds > 0:
+        return f"冷却 {cooldown_seconds}s"
+    if int(row.get("consecutive_failures") or 0) > 0 and str(row.get("status") or "") == "error":
+        status_code = row.get("last_status_code")
+        if status_code:
+            return f"异常 {status_code}"
+        error_kind = str(row.get("error_kind") or "").strip()
+        return f"异常 {error_kind or '失败'}"
+    if int(payload_float(row.get("last_success_ms")) or 0):
+        return "正常"
+    if current_status == "ok":
+        return "正常"
+    return "待采样"
+
+
+def build_exchange_health_frame(
+    request_health_rows: List[Dict[str, Any]],
+    *,
+    service: LiveTerminalService,
+    snapshot_by_key: Dict[str, ExchangeSnapshot],
+    spot_snapshot_map: Dict[str, SpotSnapshot],
+    available_perp_keys: List[str],
+    available_spot_keys: List[str],
+    catalog_status: Dict[str, Dict[str, str]],
+) -> pd.DataFrame:
+    request_index = {
+        (str(row.get("exchange_key") or ""), str(row.get("market") or "")): dict(row)
+        for row in request_health_rows
+    }
+    rows: List[Dict[str, Any]] = []
+    for exchange_key in EXCHANGE_ORDER:
+        exchange_title = EXCHANGE_TITLES[exchange_key]
+        perp_snapshot = snapshot_by_key.get(exchange_key)
+        spot_snapshot = spot_snapshot_map.get(exchange_key)
+        perp_row = request_index.get((exchange_key, "perp"), {})
+        spot_row = request_index.get((exchange_key, "spot"), {})
+        perp_available = exchange_key in available_perp_keys or str((catalog_status.get(exchange_key) or {}).get("perp") or "") == "error"
+        spot_available = exchange_key in available_spot_keys or str((catalog_status.get(exchange_key) or {}).get("spot") or "") == "error"
+        catalog_parts: List[str] = []
+        perp_catalog_status = str((catalog_status.get(exchange_key) or {}).get("perp") or "")
+        spot_catalog_status = str((catalog_status.get(exchange_key) or {}).get("spot") or "")
+        catalog_parts.append("合约目录受限" if perp_catalog_status == "error" else "合约可用" if exchange_key in available_perp_keys else "合约未命中")
+        if exchange_key == "hyperliquid":
+            catalog_parts.append("现货未接入")
+        else:
+            catalog_parts.append("现货目录受限" if spot_catalog_status == "error" else "现货可用" if exchange_key in available_spot_keys else "现货未命中")
+        perp_transport = service.get_transport_health(exchange_key)
+        spot_transport = service.get_transport_health(exchange_key, spot=True) if exchange_key in SPOT_EXCHANGE_ORDER else {"status": "unsupported"}
+        latest_success_ms = max(
+            int(payload_float(perp_row.get("last_success_ms")) or 0),
+            int(payload_float(spot_row.get("last_success_ms")) or 0),
+        ) or None
+        latest_error_items = [
+            (
+                int(payload_float(perp_row.get("last_error_ms")) or 0),
+                str(perp_row.get("last_error") or "").strip(),
+            ),
+            (
+                int(payload_float(spot_row.get("last_error_ms")) or 0),
+                str(spot_row.get("last_error") or "").strip(),
+            ),
+        ]
+        latest_error_ms, latest_error_text = max(latest_error_items, key=lambda item: item[0])
+        notes: List[str] = []
+        if any(int(row.get("cooldown_remaining_s") or 0) > 0 for row in (perp_row, spot_row)):
+            notes.append("自动冷却中")
+        if "error" in {perp_catalog_status, spot_catalog_status}:
+            notes.append("目录受限时仍按默认符号继续尝试")
+        if str(perp_row.get("error_kind") or "") in {"legal", "forbidden", "rate_limit"} or str(spot_row.get("error_kind") or "") in {"legal", "forbidden", "rate_limit"}:
+            notes.append("云端/风控受限")
+        if str(perp_transport.get("sync_state") or "") == "degraded" or str(spot_transport.get("sync_state") or "") == "degraded":
+            notes.append("WS待修复")
+        rows.append(
+            {
+                "交易所": exchange_title,
+                "目录": " | ".join(catalog_parts),
+                "合约REST": _request_health_state_label(perp_row, available=perp_available, current_status=getattr(perp_snapshot, "status", None)),
+                "现货REST": "未接入" if exchange_key == "hyperliquid" else _request_health_state_label(spot_row, available=spot_available, current_status=getattr(spot_snapshot, "status", None)),
+                "合约WS": _transport_health_state_label(perp_transport, available=perp_available, market="perp"),
+                "现货WS": "未接入" if exchange_key == "hyperliquid" else _transport_health_state_label(spot_transport, available=spot_available, market="spot"),
+                "连续失败": max(int(perp_row.get("consecutive_failures") or 0), int(spot_row.get("consecutive_failures") or 0)),
+                "冷却剩余(s)": max(int(perp_row.get("cooldown_remaining_s") or 0), int(spot_row.get("cooldown_remaining_s") or 0)),
+                "最近成功": format_display_timestamp_ms(latest_success_ms),
+                "最近错误": "-" if not latest_error_text else f"{format_display_timestamp_ms(latest_error_ms)} | {latest_error_text[:48]}",
+                "说明": " / ".join(notes) if notes else "正常采样",
+            }
+        )
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return pd.DataFrame(columns=["交易所", "目录", "合约REST", "现货REST", "合约WS", "现货WS", "连续失败", "冷却剩余(s)", "最近成功", "最近错误", "说明"])
+    return frame
+
+
+def build_spot_perp_decision_frame(
+    spot_exchange_frame: pd.DataFrame,
+    lead_lag_frame: pd.DataFrame,
+    contract_sentiment_frame: pd.DataFrame,
+    perp_crowding_trio_frame: pd.DataFrame,
+    funding_regime_frame: pd.DataFrame,
+) -> pd.DataFrame:
+    exchange_names = sorted(
+        set(spot_exchange_frame.get("交易所", pd.Series(dtype=str)).dropna().astype(str))
+        | set(lead_lag_frame.get("交易所", pd.Series(dtype=str)).dropna().astype(str))
+        | set(contract_sentiment_frame.get("交易所", pd.Series(dtype=str)).dropna().astype(str))
+        | set(perp_crowding_trio_frame.get("交易所", pd.Series(dtype=str)).dropna().astype(str))
+        | set(funding_regime_frame.get("交易所", pd.Series(dtype=str)).dropna().astype(str))
+    )
+    rows: List[Dict[str, Any]] = []
+    for exchange_name in exchange_names:
+        spot_row = (
+            spot_exchange_frame[spot_exchange_frame["交易所"].astype(str) == exchange_name].iloc[0].to_dict()
+            if not spot_exchange_frame.empty and "交易所" in spot_exchange_frame.columns and exchange_name in set(spot_exchange_frame["交易所"].astype(str))
+            else {}
+        )
+        lead_row = (
+            lead_lag_frame[lead_lag_frame["交易所"].astype(str) == exchange_name].iloc[0].to_dict()
+            if not lead_lag_frame.empty and "交易所" in lead_lag_frame.columns and exchange_name in set(lead_lag_frame["交易所"].astype(str))
+            else {}
+        )
+        sentiment_row = (
+            contract_sentiment_frame[contract_sentiment_frame["交易所"].astype(str) == exchange_name].iloc[0].to_dict()
+            if not contract_sentiment_frame.empty and "交易所" in contract_sentiment_frame.columns and exchange_name in set(contract_sentiment_frame["交易所"].astype(str))
+            else {}
+        )
+        crowd_row = (
+            perp_crowding_trio_frame[perp_crowding_trio_frame["交易所"].astype(str) == exchange_name].iloc[0].to_dict()
+            if not perp_crowding_trio_frame.empty and "交易所" in perp_crowding_trio_frame.columns and exchange_name in set(perp_crowding_trio_frame["交易所"].astype(str))
+            else {}
+        )
+        funding_row = (
+            funding_regime_frame[funding_regime_frame["交易所"].astype(str) == exchange_name].iloc[0].to_dict()
+            if not funding_regime_frame.empty and "交易所" in funding_regime_frame.columns and exchange_name in set(funding_regime_frame["交易所"].astype(str))
+            else {}
+        )
+        spot_buy_ratio = payload_float(spot_row.get("现货主动买占比(%)"))
+        basis_pct = payload_float(spot_row.get("Basis(%)") or funding_row.get("Basis(%)"))
+        volume_ratio = payload_float(spot_row.get("永续/现货成交额比"))
+        lead_summary = str(lead_row.get("提示") or "").strip()
+        lead_seconds = payload_float(lead_row.get("领先秒数"))
+        lead_correlation = payload_float(lead_row.get("相关性"))
+        lead_confidence = _confidence_score_from_label(lead_row.get("置信度"))
+        contract_ratio = payload_float(sentiment_row.get("合约多空比") or crowd_row.get("合约多空比"))
+        oi_change_pct = payload_float(crowd_row.get("OI变化(%)"))
+        taker_buy_ratio = payload_float(crowd_row.get("主动流买占比(%)") or sentiment_row.get("主动流买占比(%)"))
+        funding_bps = payload_float(funding_row.get("Funding(bps)") or sentiment_row.get("资金费率(bps)"))
+
+        regime = "混合观察"
+        action = "等待更清晰的现货/合约联动"
+        if "现货领先" in lead_summary:
+            regime = "现货先动"
+            action = "盯合约是否跟价放量"
+        elif "合约领先" in lead_summary or "永续领先" in lead_summary:
+            regime = "合约抢跑"
+            action = "防现货不跟的回撤"
+        elif volume_ratio is not None and volume_ratio >= 1.6 and taker_buy_ratio is not None and abs(taker_buy_ratio - 50.0) >= 8.0:
+            regime = "合约追价"
+            action = "结合 Basis / Funding 判断是否挤仓"
+        elif spot_buy_ratio is not None and abs(spot_buy_ratio - 50.0) >= 8.0 and (volume_ratio is None or volume_ratio < 1.35):
+            regime = "现货主导"
+            action = "优先看现货扫单持续性"
+        elif contract_ratio is not None and oi_change_pct is not None and funding_bps is not None and contract_ratio > 1.08 and oi_change_pct > 0 and funding_bps > 0:
+            regime = "偏多拥挤"
+            action = "防 short squeeze 后衰竭"
+        elif contract_ratio is not None and oi_change_pct is not None and funding_bps is not None and contract_ratio < 0.92 and oi_change_pct > 0 and funding_bps < 0:
+            regime = "偏空拥挤"
+            action = "防 long flush 扩大"
+
+        confidence_score = 0.0
+        confidence_score += 0.34 * lead_confidence
+        confidence_score += 0.12 if spot_buy_ratio is not None else 0.0
+        confidence_score += 0.12 if taker_buy_ratio is not None else 0.0
+        confidence_score += 0.12 if oi_change_pct is not None else 0.0
+        confidence_score += 0.1 if funding_bps is not None else 0.0
+        confidence_score += 0.08 if basis_pct is not None else 0.0
+        confidence_score += 0.06 if volume_ratio is not None else 0.0
+        if lead_correlation is not None and abs(float(lead_correlation)) >= 0.28:
+            confidence_score += 0.08
+        confidence_score = min(1.0, confidence_score)
+        explanation_parts = []
+        if spot_buy_ratio is not None:
+            explanation_parts.append(f"现货主动买 {spot_buy_ratio:.1f}%")
+        if taker_buy_ratio is not None:
+            explanation_parts.append(f"合约主动买 {taker_buy_ratio:.1f}%")
+        if oi_change_pct is not None:
+            explanation_parts.append(f"OI变化 {oi_change_pct:.2f}%")
+        if funding_bps is not None:
+            explanation_parts.append(f"Funding {funding_bps:.2f}bps")
+        if lead_summary:
+            explanation_parts.append(lead_summary)
+        rows.append(
+            {
+                "交易所": exchange_name,
+                "主导判断": regime,
+                "建议动作": action,
+                "Lead/Lag": lead_summary or "样本不足",
+                "领先秒数": lead_seconds,
+                "相关性": lead_correlation,
+                "现货主动买占比(%)": spot_buy_ratio,
+                "合约主动买占比(%)": taker_buy_ratio,
+                "合约多空比": contract_ratio,
+                "OI变化(%)": oi_change_pct,
+                "Funding(bps)": funding_bps,
+                "Basis(%)": basis_pct,
+                "永续/现货成交额比": volume_ratio,
+                "置信度": _confidence_label(confidence_score),
+                "说明": " | ".join(explanation_parts[:5]) if explanation_parts else "样本不足",
+            }
+        )
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return pd.DataFrame(columns=["交易所", "主导判断", "建议动作", "Lead/Lag", "领先秒数", "相关性", "现货主动买占比(%)", "合约主动买占比(%)", "合约多空比", "OI变化(%)", "Funding(bps)", "Basis(%)", "永续/现货成交额比", "置信度", "说明"])
+    return frame.sort_values(by=["置信度", "交易所"], ascending=[False, True], na_position="last").reset_index(drop=True)
+
+
+def build_history_workbench_payload(
+    history_store: Any,
+    *,
+    coin: str,
+    exchange_keys: List[str],
+    markets: List[str],
+    event_categories: List[str],
+    since_ms: int,
+) -> Dict[str, pd.DataFrame]:
+    selected_markets = [str(market) for market in markets if str(market) in {"perp", "spot"}] or ["perp"]
+    market_frames: List[pd.DataFrame] = []
+    quality_frames: List[pd.DataFrame] = []
+    for market in selected_markets:
+        market_frame = history_store.load_market_history(
+            coin=coin,
+            exchange_keys=exchange_keys,
+            market=market,
+            since_ms=since_ms,
+            limit=5000,
+        )
+        if not market_frame.empty:
+            market_frames.append(market_frame.assign(市场=market))
+        quality_frame = history_store.load_quality_history(
+            coin=coin,
+            exchange_keys=exchange_keys,
+            market=market,
+            since_ms=since_ms,
+            limit=3200,
+        )
+        if not quality_frame.empty:
+            quality_frames.append(quality_frame)
+    market_history_frame = _concat_non_empty_frames(market_frames)
+    if not market_history_frame.empty and "时间" in market_history_frame.columns:
+        market_history_frame = market_history_frame.sort_values("时间").reset_index(drop=True)
+    event_history_frame = history_store.load_market_events(
+        coin=coin,
+        exchange_keys=exchange_keys,
+        since_ms=since_ms,
+        limit=4200,
+    )
+    if not event_history_frame.empty:
+        if "市场" in event_history_frame.columns:
+            event_history_frame = event_history_frame[event_history_frame["市场"].astype(str).isin(selected_markets)]
+        normalized_categories = [category for category in event_categories if category != "all"]
+        if normalized_categories and "类型" in event_history_frame.columns:
+            event_history_frame = event_history_frame[event_history_frame["类型"].astype(str).isin(normalized_categories)]
+        event_history_frame = event_history_frame.sort_values("时间", ascending=False).reset_index(drop=True)
+    quality_history_frame = _concat_non_empty_frames(quality_frames)
+    if not quality_history_frame.empty and "时间" in quality_history_frame.columns:
+        quality_history_frame = quality_history_frame.sort_values("时间", ascending=False).reset_index(drop=True)
+    alert_history_frame = history_store.load_alert_events(coin=coin, since_ms=since_ms, limit=1000)
+    if not alert_history_frame.empty and exchange_keys and "交易所键" in alert_history_frame.columns:
+        alert_history_frame = alert_history_frame[alert_history_frame["交易所键"].astype(str).isin(exchange_keys)].reset_index(drop=True)
+    return {
+        "market_history_frame": market_history_frame,
+        "event_history_frame": event_history_frame,
+        "quality_history_frame": quality_history_frame,
+        "alert_history_frame": alert_history_frame,
+    }
+
+
+def build_history_workbench_figure(market_history_frame: pd.DataFrame) -> go.Figure:
+    figure = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        specs=[[{"secondary_y": True}], [{"secondary_y": True}]],
+        subplot_titles=("价格 / OI金额", "Funding / 24h成交额"),
+    )
+    if market_history_frame.empty or "时间" not in market_history_frame.columns:
+        figure.update_layout(height=520, margin=dict(l=18, r=18, t=48, b=18))
+        return figure
+    frame = market_history_frame.copy().sort_values("时间")
+    legend_names = []
+    if "市场" in frame.columns:
+        legend_names = (frame["交易所"].astype(str) + " · " + frame["市场"].astype(str)).unique().tolist()
+    else:
+        legend_names = frame["交易所"].astype(str).unique().tolist()
+    for legend_name in legend_names:
+        if "市场" in frame.columns:
+            exchange_name, market = legend_name.split(" · ", 1)
+            subset = frame[(frame["交易所"].astype(str) == exchange_name) & (frame["市场"].astype(str) == market)]
+        else:
+            subset = frame[frame["交易所"].astype(str) == legend_name]
+        if subset.empty:
+            continue
+        if "最新价" in subset.columns and subset["最新价"].notna().any():
+            figure.add_trace(
+                go.Scatter(
+                    x=subset["时间"],
+                    y=subset["最新价"],
+                    mode="lines",
+                    name=f"{legend_name} 价格",
+                    line=dict(width=2.2),
+                ),
+                row=1,
+                col=1,
+                secondary_y=False,
+            )
+        if "OI金额" in subset.columns and subset["OI金额"].notna().any():
+            figure.add_trace(
+                go.Scatter(
+                    x=subset["时间"],
+                    y=subset["OI金额"],
+                    mode="lines",
+                    name=f"{legend_name} OI",
+                    line=dict(width=1.4, dash="dot"),
+                    opacity=0.72,
+                ),
+                row=1,
+                col=1,
+                secondary_y=True,
+            )
+        if "Funding(bps)" in subset.columns and subset["Funding(bps)"].notna().any():
+            figure.add_trace(
+                go.Scatter(
+                    x=subset["时间"],
+                    y=subset["Funding(bps)"],
+                    mode="lines",
+                    name=f"{legend_name} Funding",
+                    line=dict(width=1.7),
+                    opacity=0.88,
+                ),
+                row=2,
+                col=1,
+                secondary_y=False,
+            )
+        if "24h成交额" in subset.columns and subset["24h成交额"].notna().any():
+            figure.add_trace(
+                go.Scatter(
+                    x=subset["时间"],
+                    y=subset["24h成交额"],
+                    mode="lines",
+                    name=f"{legend_name} 24h成交额",
+                    line=dict(width=1.2, dash="dash"),
+                    opacity=0.48,
+                ),
+                row=2,
+                col=1,
+                secondary_y=True,
+            )
+    figure.update_layout(height=540, margin=dict(l=18, r=18, t=48, b=18), legend=dict(orientation="h"))
+    figure.update_yaxes(title_text="价格", row=1, col=1, secondary_y=False)
+    figure.update_yaxes(title_text="OI金额", row=1, col=1, secondary_y=True)
+    figure.update_yaxes(title_text="Funding(bps)", row=2, col=1, secondary_y=False)
+    figure.update_yaxes(title_text="24h成交额", row=2, col=1, secondary_y=True)
+    return figure
+
+
+def build_history_event_mix_figure(event_history_frame: pd.DataFrame) -> go.Figure:
+    figure = go.Figure()
+    if event_history_frame.empty or "交易所" not in event_history_frame.columns or "类型" not in event_history_frame.columns:
+        figure.update_layout(height=320, margin=dict(l=18, r=18, t=32, b=18))
+        return figure
+    grouped = (
+        event_history_frame.groupby(["交易所", "类型"], as_index=False)
+        .agg(名义金额=("名义金额", "sum"), 事件数=("类型", "size"))
+        .sort_values(["交易所", "名义金额"], ascending=[True, False])
+    )
+    for event_type in grouped["类型"].astype(str).unique():
+        subset = grouped[grouped["类型"].astype(str) == event_type]
+        figure.add_trace(
+            go.Bar(
+                x=subset["交易所"],
+                y=subset["名义金额"],
+                name=event_type,
+                text=subset["事件数"],
+                textposition="outside",
+            )
+        )
+    figure.update_layout(
+        barmode="stack",
+        height=320,
+        margin=dict(l=18, r=18, t=32, b=18),
+        xaxis_title="交易所",
+        yaxis_title="名义金额",
+        legend=dict(orientation="h"),
+    )
+    return figure
+
+
+def build_unified_signal_frame(
+    decision_frame: pd.DataFrame,
+    sentiment_alert_frame: pd.DataFrame,
+    confirmed_alert_frame: pd.DataFrame,
+    share_dynamics_frame: pd.DataFrame,
+    risk_buffer_frame: pd.DataFrame,
+) -> pd.DataFrame:
+    exchange_names = sorted(
+        set(decision_frame.get("交易所", pd.Series(dtype=str)).dropna().astype(str))
+        | set(share_dynamics_frame.get("交易所", pd.Series(dtype=str)).dropna().astype(str))
+        | set(risk_buffer_frame.get("交易所", pd.Series(dtype=str)).dropna().astype(str))
+    )
+    rows: List[Dict[str, Any]] = []
+    for exchange_name in exchange_names:
+        decision_row = (
+            decision_frame[decision_frame["交易所"].astype(str) == exchange_name].iloc[0].to_dict()
+            if not decision_frame.empty and "交易所" in decision_frame.columns and exchange_name in set(decision_frame["交易所"].astype(str))
+            else {}
+        )
+        share_row = (
+            share_dynamics_frame[share_dynamics_frame["交易所"].astype(str) == exchange_name].iloc[0].to_dict()
+            if not share_dynamics_frame.empty and "交易所" in share_dynamics_frame.columns and exchange_name in set(share_dynamics_frame["交易所"].astype(str))
+            else {}
+        )
+        risk_row = (
+            risk_buffer_frame[risk_buffer_frame["交易所"].astype(str) == exchange_name].iloc[0].to_dict()
+            if not risk_buffer_frame.empty and "交易所" in risk_buffer_frame.columns and exchange_name in set(risk_buffer_frame["交易所"].astype(str))
+            else {}
+        )
+        strong_alerts = 0
+        if not confirmed_alert_frame.empty and "交易所" in confirmed_alert_frame.columns:
+            strong_alerts = int(
+                confirmed_alert_frame[
+                    (confirmed_alert_frame["交易所"].astype(str) == exchange_name)
+                    & (confirmed_alert_frame["等级"].astype(str) == "强")
+                ].shape[0]
+            )
+        sentiment_alerts = 0
+        if not sentiment_alert_frame.empty and "交易所" in sentiment_alert_frame.columns:
+            sentiment_alerts = int(sentiment_alert_frame[sentiment_alert_frame["交易所"].astype(str) == exchange_name].shape[0])
+        confidence_score = _confidence_score_from_label(decision_row.get("置信度"))
+        oi_share_delta = payload_float(share_row.get("OI份额Δ(%)"))
+        perp_share_delta = payload_float(share_row.get("合约成交份额Δ(%)"))
+        spot_share_delta = payload_float(share_row.get("现货成交份额Δ(%)"))
+        risk_ratio = payload_float(risk_row.get("OI/24h成交比"))
+        regime = str(decision_row.get("主导判断") or "混合观察")
+        direction = "中性"
+        if regime in {"现货先动", "现货主导", "偏多拥挤"}:
+            direction = "偏多"
+        elif regime in {"合约抢跑", "偏空拥挤"}:
+            direction = "偏空"
+        if payload_float(decision_row.get("合约多空比")) is not None:
+            ratio_value = float(payload_float(decision_row.get("合约多空比")) or 1.0)
+            if ratio_value > 1.06:
+                direction = "偏多"
+            elif ratio_value < 0.94:
+                direction = "偏空"
+        total_score = 45.0 * confidence_score
+        total_score += min(18.0, abs(float(oi_share_delta or 0.0)) * 3.2)
+        total_score += min(12.0, abs(float(perp_share_delta or 0.0)) * 2.2)
+        total_score += min(10.0, abs(float(spot_share_delta or 0.0)) * 2.0)
+        total_score += min(10.0, strong_alerts * 4.0 + sentiment_alerts * 1.5)
+        total_score += min(5.0, abs(float(risk_ratio or 0.0) - 1.0) * 0.8 if risk_ratio is not None else 0.0)
+        total_score = min(100.0, total_score)
+        execution_hint = "等待"
+        if regime in {"现货先动", "现货主导"}:
+            execution_hint = "优先现货"
+        elif regime in {"合约追价", "合约抢跑", "偏多拥挤", "偏空拥挤"}:
+            execution_hint = "优先合约"
+        reason_parts = []
+        if regime and regime != "混合观察":
+            reason_parts.append(regime)
+        if oi_share_delta is not None and abs(oi_share_delta) >= 0.3:
+            reason_parts.append(f"OI份额Δ {oi_share_delta:.2f}%")
+        if perp_share_delta is not None and abs(perp_share_delta) >= 0.3:
+            reason_parts.append(f"合约份额Δ {perp_share_delta:.2f}%")
+        if strong_alerts:
+            reason_parts.append(f"强告警 {strong_alerts}")
+        rows.append(
+            {
+                "交易所": exchange_name,
+                "统一评分": round(total_score, 1),
+                "方向": direction,
+                "主判断": regime,
+                "执行偏好": execution_hint,
+                "置信度": decision_row.get("置信度") or "低置信",
+                "强告警": strong_alerts,
+                "情绪告警": sentiment_alerts,
+                "OI份额Δ(%)": oi_share_delta,
+                "合约成交份额Δ(%)": perp_share_delta,
+                "现货成交份额Δ(%)": spot_share_delta,
+                "风险比": risk_ratio,
+                "原因": " | ".join(reason_parts[:4]) if reason_parts else "等待更清晰样本",
+            }
+        )
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return pd.DataFrame(columns=["交易所", "统一评分", "方向", "主判断", "执行偏好", "置信度", "强告警", "情绪告警", "OI份额Δ(%)", "合约成交份额Δ(%)", "现货成交份额Δ(%)", "风险比", "原因"])
+    return frame.sort_values(["统一评分", "交易所"], ascending=[False, True]).reset_index(drop=True)
+
+
+def build_unified_signal_figure(frame: pd.DataFrame) -> go.Figure:
+    figure = go.Figure()
+    if frame.empty:
+        figure.add_annotation(text="等待统一评分样本", showarrow=False, x=0.5, y=0.5, xref="paper", yref="paper")
+        figure.update_layout(height=300, margin=dict(l=12, r=12, t=24, b=12))
+        return figure
+    colors = []
+    for _, row in frame.iterrows():
+        direction = str(row.get("方向") or "")
+        if direction == "偏多":
+            colors.append("#6fdd8c")
+        elif direction == "偏空":
+            colors.append("#ff9a59")
+        else:
+            colors.append("#67d1ff")
+    figure.add_trace(
+        go.Bar(
+            x=frame["交易所"],
+            y=frame["统一评分"],
+            marker_color=colors,
+            text=[f"{value:.1f}" for value in frame["统一评分"].fillna(0.0)],
+            textposition="outside",
+            customdata=frame[["主判断", "执行偏好", "原因"]],
+            hovertemplate="%{x}<br>统一评分 %{y:.1f}<br>%{customdata[0]}<br>%{customdata[1]}<br>%{customdata[2]}<extra></extra>",
+        )
+    )
+    figure.update_layout(
+        height=320,
+        margin=dict(l=12, r=12, t=58, b=12),
+        paper_bgcolor="rgba(14, 22, 35, 0.56)",
+        plot_bgcolor="rgba(255, 255, 255, 0.045)",
+        font=dict(color="#f6f9ff", family="SF Pro Display, Segoe UI, sans-serif"),
+        title=dict(text="Unified Signal Score", x=0.03, y=0.98, xanchor="left", font=dict(size=18, color="#f7fbff")),
+    )
+    figure.update_xaxes(showgrid=False)
+    figure.update_yaxes(showgrid=True, gridcolor="rgba(255, 255, 255, 0.08)", title="统一评分")
+    return figure
+
+
+def build_execution_route_frame(
+    spot_execution_frame: pd.DataFrame,
+    perp_execution_frame: pd.DataFrame,
+    decision_frame: pd.DataFrame,
+) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    decision_lookup = {
+        str(row.get("交易所") or ""): row
+        for row in decision_frame.to_dict("records")
+    } if not decision_frame.empty else {}
+    for source_frame, market_label in ((spot_execution_frame, "现货"), (perp_execution_frame, "合约")):
+        if source_frame.empty:
+            continue
+        for row in source_frame.to_dict("records"):
+            exchange_name = str(row.get("交易所") or "")
+            decision_row = decision_lookup.get(exchange_name, {})
+            spread_bps = payload_float(row.get("价差(bps)"))
+            impact_50k = payload_float(row.get("50k冲击(bps)"))
+            impact_250k = payload_float(row.get("250k冲击(bps)"))
+            fill_50k = payload_float(row.get("50k填充率(%)"))
+            fill_250k = payload_float(row.get("250k填充率(%)"))
+            visible_depth = payload_float(row.get("可见深度"))
+            cost_score = 0.0
+            for value, weight in ((spread_bps, 1.0), (impact_50k, 1.3), (impact_250k, 0.6)):
+                if value is not None:
+                    cost_score += float(value) * weight
+            if fill_50k is not None:
+                cost_score -= max(0.0, float(fill_50k) - 60.0) * 0.08
+            if fill_250k is not None:
+                cost_score -= max(0.0, float(fill_250k) - 45.0) * 0.05
+            if visible_depth is not None:
+                cost_score -= min(18.0, math.log10(max(float(visible_depth), 1.0)) * 2.6)
+            execution_hint = "观察"
+            decision_label = str(decision_row.get("主导判断") or "")
+            if market_label == "现货" and decision_label in {"现货先动", "现货主导"}:
+                execution_hint = "优先现货"
+            elif market_label == "合约" and decision_label in {"合约追价", "合约抢跑", "偏多拥挤", "偏空拥挤"}:
+                execution_hint = "优先合约"
+            elif cost_score <= 6.0:
+                execution_hint = "可优先"
+            elif cost_score >= 18.0:
+                execution_hint = "谨慎"
+            rows.append(
+                {
+                    "路由": f"{exchange_name} | {market_label}",
+                    "交易所": exchange_name,
+                    "市场": market_label,
+                    "执行评分": round(max(0.0, 100.0 - max(0.0, cost_score) * 4.0), 1),
+                    "价差(bps)": spread_bps,
+                    "50k冲击(bps)": impact_50k,
+                    "250k冲击(bps)": impact_250k,
+                    "50k填充率(%)": fill_50k,
+                    "250k填充率(%)": fill_250k,
+                    "可见深度": visible_depth,
+                    "执行建议": execution_hint,
+                    "关联判断": decision_label or "等待样本",
+                }
+            )
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return pd.DataFrame(columns=["路由", "交易所", "市场", "执行评分", "价差(bps)", "50k冲击(bps)", "250k冲击(bps)", "50k填充率(%)", "250k填充率(%)", "可见深度", "执行建议", "关联判断"])
+    return frame.sort_values(["执行评分", "50k冲击(bps)"], ascending=[False, True], na_position="last").reset_index(drop=True)
+
+
+def build_alert_closure_frame(
+    alert_history_frame: pd.DataFrame,
+    market_history_frame: pd.DataFrame,
+    event_history_frame: pd.DataFrame,
+    quality_history_frame: pd.DataFrame,
+    *,
+    review_window_minutes: int,
+    limit: int = 24,
+) -> pd.DataFrame:
+    if alert_history_frame.empty or market_history_frame.empty:
+        return pd.DataFrame(columns=["时间", "交易所", "告警", "触发价格", "触发Funding", "触发OI", "5m事件额", "5m事件数", "近价撤补比", "顺风区间(%)", "逆风区间(%)", "窗口收益(%)", "命中"])
+    alert_review_frame = build_alert_review_frame(
+        alert_history_frame,
+        market_history_frame,
+        review_window_minutes=review_window_minutes,
+    )
+    alerts = alert_history_frame[alert_history_frame["动作"] == "触发"].copy()
+    if alerts.empty:
+        return pd.DataFrame(columns=["时间", "交易所", "告警", "触发价格", "触发Funding", "触发OI", "5m事件额", "5m事件数", "近价撤补比", "顺风区间(%)", "逆风区间(%)", "窗口收益(%)", "命中"])
+    alerts["ts_ms"] = (pd.to_datetime(alerts["时间"]).astype("int64") // 10**6).astype(int)
+    market = market_history_frame.copy()
+    market["ts_ms"] = (pd.to_datetime(market["时间"]).astype("int64") // 10**6).astype(int)
+    events = event_history_frame.copy()
+    if not events.empty:
+        events["ts_ms"] = (pd.to_datetime(events["时间"]).astype("int64") // 10**6).astype(int)
+    quality = quality_history_frame.copy()
+    if not quality.empty:
+        quality["ts_ms"] = (pd.to_datetime(quality["时间"]).astype("int64") // 10**6).astype(int)
+    review_lookup = {
+        (str(row.get("时间")), str(row.get("交易所")), str(row.get("告警"))): row
+        for row in alert_review_frame.to_dict("records")
+    } if not alert_review_frame.empty else {}
+    rows: List[Dict[str, Any]] = []
+    for row in alerts.sort_values("ts_ms", ascending=False).head(limit).to_dict("records"):
+        exchange_key = str(row.get("交易所键") or "")
+        exchange_name = str(row.get("交易所") or "")
+        title = str(row.get("告警") or "")
+        alert_ts = int(row.get("ts_ms") or 0)
+        if exchange_key and "交易所键" in market.columns:
+            market_slice = market[market["交易所键"].astype(str) == exchange_key].copy()
+        else:
+            market_slice = market[market["交易所"].astype(str) == exchange_name].copy()
+        if market_slice.empty:
+            continue
+        trigger_market = market_slice.iloc[(market_slice["ts_ms"] - alert_ts).abs().argsort()[:1]].iloc[0].to_dict()
+        event_notional = None
+        event_count = 0
+        if not events.empty:
+            event_slice = events
+            if exchange_key and "交易所键" in events.columns:
+                event_slice = event_slice[event_slice["交易所键"].astype(str) == exchange_key]
+            else:
+                event_slice = event_slice[event_slice["交易所"].astype(str) == exchange_name]
+            event_slice = event_slice[(event_slice["ts_ms"] >= alert_ts) & (event_slice["ts_ms"] <= alert_ts + 5 * 60_000)]
+            event_count = int(len(event_slice))
+            if "名义金额" in event_slice.columns and not event_slice.empty:
+                event_notional = float(pd.to_numeric(event_slice["名义金额"], errors="coerce").fillna(0.0).sum())
+        cancel_refill_ratio = None
+        if not quality.empty:
+            quality_slice = quality
+            if exchange_key and "交易所键" in quality.columns:
+                quality_slice = quality_slice[quality_slice["交易所键"].astype(str) == exchange_key]
+            else:
+                quality_slice = quality_slice[quality_slice["交易所"].astype(str) == exchange_name]
+            quality_slice = quality_slice[(quality_slice["ts_ms"] >= alert_ts - 2 * 60_000) & (quality_slice["ts_ms"] <= alert_ts + 2 * 60_000)]
+            if not quality_slice.empty:
+                added_sum = float(pd.to_numeric(quality_slice["近价新增"], errors="coerce").fillna(0.0).sum()) if "近价新增" in quality_slice.columns else 0.0
+                canceled_sum = float(pd.to_numeric(quality_slice["近价撤单"], errors="coerce").fillna(0.0).sum()) if "近价撤单" in quality_slice.columns else 0.0
+                cancel_refill_ratio = canceled_sum / max(added_sum, 1.0)
+        review_row = review_lookup.get((str(row.get("时间")), exchange_name, title), {})
+        rows.append(
+            {
+                "时间": row.get("时间"),
+                "交易所": exchange_name,
+                "告警": title,
+                "触发价格": payload_float(trigger_market.get("最新价")),
+                "触发Funding": payload_float(trigger_market.get("Funding(bps)")),
+                "触发OI": payload_float(trigger_market.get("OI金额")),
+                "5m事件额": event_notional,
+                "5m事件数": event_count,
+                "近价撤补比": cancel_refill_ratio,
+                "顺风区间(%)": payload_float(review_row.get("顺风区间(%)")),
+                "逆风区间(%)": payload_float(review_row.get("逆风区间(%)")),
+                "窗口收益(%)": payload_float(review_row.get("窗口收益(%)")),
+                "命中": review_row.get("命中") or "-",
+            }
+        )
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return pd.DataFrame(columns=["时间", "交易所", "告警", "触发价格", "触发Funding", "触发OI", "5m事件额", "5m事件数", "近价撤补比", "顺风区间(%)", "逆风区间(%)", "窗口收益(%)", "命中"])
+    return frame.reset_index(drop=True)
+
+
+def build_cross_exchange_propagation_frame(
+    decision_frame: pd.DataFrame,
+    share_dynamics_frame: pd.DataFrame,
+    spread_frame: pd.DataFrame,
+    funding_arb_frame: pd.DataFrame,
+    cluster_frame: pd.DataFrame,
+) -> pd.DataFrame:
+    exchange_names = sorted(
+        set(decision_frame.get("交易所", pd.Series(dtype=str)).dropna().astype(str))
+        | set(share_dynamics_frame.get("交易所", pd.Series(dtype=str)).dropna().astype(str))
+        | set(spread_frame.get("交易所", pd.Series(dtype=str)).dropna().astype(str))
+    )
+    latest_cluster_exchanges: List[str] = []
+    latest_cluster_label = ""
+    if not cluster_frame.empty and "交易所" in cluster_frame.columns:
+        latest_cluster = cluster_frame.iloc[0].to_dict()
+        latest_cluster_label = str(latest_cluster.get("主导方向") or "")
+        latest_cluster_exchanges = [part.strip() for part in str(latest_cluster.get("交易所") or "").split("/") if part.strip()]
+    arb_text = ""
+    if not funding_arb_frame.empty:
+        arb_row = funding_arb_frame.iloc[0].to_dict()
+        arb_text = str(arb_row.get("提示") or "")
+    rows: List[Dict[str, Any]] = []
+    for exchange_name in exchange_names:
+        decision_row = (
+            decision_frame[decision_frame["交易所"].astype(str) == exchange_name].iloc[0].to_dict()
+            if not decision_frame.empty and exchange_name in set(decision_frame["交易所"].astype(str))
+            else {}
+        )
+        share_row = (
+            share_dynamics_frame[share_dynamics_frame["交易所"].astype(str) == exchange_name].iloc[0].to_dict()
+            if not share_dynamics_frame.empty and exchange_name in set(share_dynamics_frame["交易所"].astype(str))
+            else {}
+        )
+        spread_row = (
+            spread_frame[spread_frame["交易所"].astype(str) == exchange_name].iloc[0].to_dict()
+            if not spread_frame.empty and exchange_name in set(spread_frame["交易所"].astype(str))
+            else {}
+        )
+        regime = str(decision_row.get("主导判断") or "混合观察")
+        oi_delta = payload_float(share_row.get("OI份额Δ(%)"))
+        perp_delta = payload_float(share_row.get("合约成交份额Δ(%)"))
+        spot_delta = payload_float(share_row.get("现货成交份额Δ(%)"))
+        price_dev_bps = payload_float(spread_row.get("偏离中位(bps)"))
+        confidence_score = _confidence_score_from_label(decision_row.get("置信度"))
+        propagation_score = 40.0 * confidence_score
+        propagation_score += min(18.0, abs(float(oi_delta or 0.0)) * 3.5)
+        propagation_score += min(16.0, abs(float(perp_delta or 0.0)) * 2.8)
+        propagation_score += min(14.0, abs(float(spot_delta or 0.0)) * 2.8)
+        propagation_score += min(10.0, abs(float(price_dev_bps or 0.0)) * 0.15)
+        if exchange_name in latest_cluster_exchanges:
+            propagation_score += 12.0
+        propagation_score = min(100.0, propagation_score)
+        role = "观察"
+        if regime in {"现货先动", "现货主导"} and (spot_delta or 0.0) >= 0:
+            role = "现货源头"
+        elif regime in {"合约追价", "合约抢跑"} and (perp_delta or 0.0) >= 0:
+            role = "合约放大"
+        elif exchange_name in latest_cluster_exchanges:
+            role = "爆仓传导"
+        path_parts = []
+        if regime and regime != "混合观察":
+            path_parts.append(regime)
+        if oi_delta is not None and abs(oi_delta) >= 0.2:
+            path_parts.append(f"OI份额Δ {oi_delta:.2f}%")
+        if price_dev_bps is not None and abs(price_dev_bps) >= 3.0:
+            path_parts.append(f"价差偏离 {price_dev_bps:.1f}bps")
+        if exchange_name in latest_cluster_exchanges and latest_cluster_label:
+            path_parts.append(latest_cluster_label)
+        if arb_text and exchange_name in arb_text:
+            path_parts.append("费率腿")
+        rows.append(
+            {
+                "交易所": exchange_name,
+                "传导评分": round(propagation_score, 1),
+                "角色": role,
+                "主判断": regime,
+                "现货份额Δ(%)": spot_delta,
+                "合约份额Δ(%)": perp_delta,
+                "OI份额Δ(%)": oi_delta,
+                "价差偏离(bps)": price_dev_bps,
+                "路径说明": " | ".join(path_parts[:4]) if path_parts else "等待更清晰的跨所样本",
+            }
+        )
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return pd.DataFrame(columns=["交易所", "传导评分", "角色", "主判断", "现货份额Δ(%)", "合约份额Δ(%)", "OI份额Δ(%)", "价差偏离(bps)", "路径说明"])
+    return frame.sort_values(["传导评分", "交易所"], ascending=[False, True]).reset_index(drop=True)
+
+
+def build_cross_exchange_propagation_figure(frame: pd.DataFrame) -> go.Figure:
+    figure = go.Figure()
+    if frame.empty:
+        figure.add_annotation(text="等待跨所传导样本", showarrow=False, x=0.5, y=0.5, xref="paper", yref="paper")
+        figure.update_layout(height=300, margin=dict(l=12, r=12, t=24, b=12))
+        return figure
+    color_map = {"现货源头": "#6fdd8c", "合约放大": "#67d1ff", "爆仓传导": "#ff9a59", "观察": "#f8d35e"}
+    figure.add_trace(
+        go.Bar(
+            x=frame["传导评分"],
+            y=frame["交易所"],
+            orientation="h",
+            marker_color=[color_map.get(str(role), "#67d1ff") for role in frame["角色"]],
+            text=frame["角色"],
+            textposition="outside",
+            customdata=frame[["主判断", "路径说明"]],
+            hovertemplate="%{y}<br>传导评分 %{x:.1f}<br>%{customdata[0]}<br>%{customdata[1]}<extra></extra>",
+        )
+    )
+    figure.update_layout(
+        height=max(300, 52 * len(frame)),
+        margin=dict(l=12, r=12, t=58, b=12),
+        paper_bgcolor="rgba(14, 22, 35, 0.56)",
+        plot_bgcolor="rgba(255, 255, 255, 0.045)",
+        font=dict(color="#f6f9ff", family="SF Pro Display, Segoe UI, sans-serif"),
+        title=dict(text="Cross-Exchange Propagation Path", x=0.03, y=0.98, xanchor="left", font=dict(size=18, color="#f7fbff")),
+    )
+    figure.update_xaxes(showgrid=True, gridcolor="rgba(255, 255, 255, 0.08)", title="传导评分")
+    figure.update_yaxes(showgrid=False, autorange="reversed")
+    return figure
+
+
+def build_hyperliquid_watch_behavior_frame(
+    bundles: List[Dict[str, Any]],
+    predicted_funding_frame: pd.DataFrame,
+    *,
+    current_coin: str,
+) -> pd.DataFrame:
+    predicted_map: Dict[str, float | None] = {}
+    if not predicted_funding_frame.empty and {"币种", "预测费率(bps)"} <= set(predicted_funding_frame.columns):
+        predicted_map = {
+            str(row.get("币种") or "").strip().upper(): payload_float(row.get("预测费率(bps)"))
+            for row in predicted_funding_frame.to_dict("records")
+        }
+    selected_coin = str(current_coin or "").strip().upper()
+    rows: List[Dict[str, Any]] = []
+    for bundle in bundles:
+        positions_frame = build_hyperliquid_position_frame(bundle)
+        raw_fills_frame = build_hyperliquid_fill_frame(bundle)
+        raw_funding_frame = build_hyperliquid_funding_frame(bundle)
+        fills_frame = raw_fills_frame.sort_values("时间") if not raw_fills_frame.empty else pd.DataFrame()
+        funding_frame = raw_funding_frame.sort_values("时间") if not raw_funding_frame.empty else pd.DataFrame()
+        filtered_positions = (
+            positions_frame[positions_frame["币种"].astype(str).str.upper() == selected_coin].copy()
+            if selected_coin and not positions_frame.empty and "币种" in positions_frame.columns
+            else positions_frame.copy()
+        )
+        current_exposure = filtered_positions["仓位价值"].fillna(0.0).sum() if not filtered_positions.empty and "仓位价值" in filtered_positions.columns else 0.0
+        total_exposure = positions_frame["仓位价值"].fillna(0.0).sum() if not positions_frame.empty and "仓位价值" in positions_frame.columns else 0.0
+        funding_net = funding_frame["金额"].fillna(0.0).sum() if not funding_frame.empty and "金额" in funding_frame.columns else 0.0
+        latest_fill = fills_frame.iloc[-1].to_dict() if not fills_frame.empty else {}
+        latest_funding = funding_frame.iloc[-1].to_dict() if not funding_frame.empty else {}
+        liq_distances: List[float] = []
+        if not filtered_positions.empty:
+            for _, row in filtered_positions.iterrows():
+                mark_price = payload_float(row.get("标记价"))
+                liq_price = payload_float(row.get("清算价"))
+                if mark_price not in (None, 0) and liq_price is not None:
+                    liq_distances.append(abs(float(mark_price) - float(liq_price)) / abs(float(mark_price)) * 100.0)
+        nearest_liq_distance = min(liq_distances) if liq_distances else None
+        latest_fill_notional = payload_float(latest_fill.get("名义金额"))
+        behavior_label = "低活跃"
+        if latest_fill_notional is not None and latest_fill_notional >= 100_000:
+            behavior_label = "刚有大额成交"
+        elif nearest_liq_distance is not None and nearest_liq_distance <= 8.0:
+            behavior_label = "靠近清算带"
+        elif abs(float(funding_net or 0.0)) >= 200.0:
+            behavior_label = "Funding 敏感"
+        elif current_exposure > 0:
+            behavior_label = "持仓观察"
+        rows.append(
+            {
+                "标签": bundle.get("label"),
+                "分组": bundle.get("group"),
+                "角色": bundle.get("role") or "user",
+                "账户权益": payload_float(bundle.get("account_value")),
+                "当前币种持仓值": current_exposure if current_exposure > 0 else None,
+                "总持仓值": total_exposure if total_exposure > 0 else None,
+                "Funding净额": funding_net if funding_net != 0 else None,
+                "最新成交方向": latest_fill.get("方向"),
+                "最新成交时间": latest_fill.get("时间"),
+                "最新成交额": latest_fill_notional,
+                "最近Funding": payload_float(latest_funding.get("金额")),
+                "预测费率(bps)": predicted_map.get(selected_coin),
+                "最近清算距离(%)": nearest_liq_distance,
+                "实时流": "在线" if bool(bundle.get("connected")) else str(bundle.get("stream_status") or "未连接"),
+                "行为标签": behavior_label,
+            }
+        )
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return pd.DataFrame(columns=["标签", "分组", "角色", "账户权益", "当前币种持仓值", "总持仓值", "Funding净额", "最新成交方向", "最新成交时间", "最新成交额", "最近Funding", "预测费率(bps)", "最近清算距离(%)", "实时流", "行为标签"])
+    return frame.sort_values(["当前币种持仓值", "总持仓值", "账户权益"], ascending=[False, False, False], na_position="last").reset_index(drop=True)
+
+
+def build_hyperliquid_watch_risk_frame(behavior_frame: pd.DataFrame) -> pd.DataFrame:
+    if behavior_frame.empty or "分组" not in behavior_frame.columns:
+        return pd.DataFrame(columns=["分组", "地址数", "在线率(%)", "账户权益", "当前币种持仓值", "总持仓值", "Funding净额", "预测费率(bps)", "最近清算距离(%)"])
+    frame = behavior_frame.copy()
+    frame["在线率(%)"] = [100.0 if "在线" in str(value or "") else 0.0 for value in frame.get("实时流", pd.Series(dtype=object))]
+    grouped = (
+        frame.groupby("分组", as_index=False)
+        .agg(
+            地址数=("标签", "size"),
+            在线率_pct=("在线率(%)", "mean"),
+            账户权益=("账户权益", "sum"),
+            当前币种持仓值=("当前币种持仓值", "sum"),
+            总持仓值=("总持仓值", "sum"),
+            Funding净额=("Funding净额", "sum"),
+            预测费率_bps=("预测费率(bps)", "mean"),
+            最近清算距离_pct=("最近清算距离(%)", "min"),
+        )
+        .sort_values(["当前币种持仓值", "总持仓值", "账户权益"], ascending=[False, False, False], na_position="last")
+        .reset_index(drop=True)
+    )
+    return grouped.rename(
+        columns={
+            "在线率_pct": "在线率(%)",
+            "预测费率_bps": "预测费率(bps)",
+            "最近清算距离_pct": "最近清算距离(%)",
+        }
+    )
 
 
 def load_spot_market_maps(
@@ -3028,6 +4079,14 @@ def fmt_compact(value) -> str:
     return f"{value:.2f}"
 
 
+def fmt_signed_compact(value) -> str:
+    if value is None:
+        return "-"
+    value = float(value)
+    sign = "+" if value >= 0 else "-"
+    return f"{sign}{fmt_compact(abs(value))}"
+
+
 def fmt_bps(value) -> str:
     return "-" if value is None else f"{value:.2f} bps"
 
@@ -3058,6 +4117,233 @@ def format_share_baseline_age(ts_ms: int | None, now_ms: int) -> str:
     if delta_seconds < 3600.0:
         return f"对比 {delta_seconds / 60.0:.1f}m 前"
     return f"对比 {delta_seconds / 3600.0:.1f}h 前"
+
+
+def _estimate_oi_delta_notional(current_notional: float | None, oi_change_pct: float | None) -> float | None:
+    if current_notional in (None, 0) or oi_change_pct is None:
+        return None
+    denominator = 1.0 + float(oi_change_pct) / 100.0
+    if abs(denominator) < 1e-9:
+        return None
+    anchor_notional = float(current_notional) / denominator
+    return float(current_notional) - anchor_notional
+
+
+def build_oi_brief_lines(
+    base_coin: str,
+    snapshot_by_key: Dict[str, ExchangeSnapshot],
+    oi_metrics_by_exchange: Dict[str, Dict[str, float | str | None]],
+    *,
+    exchange_keys: List[str],
+) -> List[str]:
+    lines: List[str] = []
+    for exchange_key in exchange_keys:
+        snapshot = snapshot_by_key.get(exchange_key)
+        if snapshot is None or snapshot.status != "ok":
+            continue
+        exchange_name = EXCHANGE_TITLES.get(exchange_key, exchange_key.title())
+        metrics = oi_metrics_by_exchange.get(exchange_name) or {}
+        oi_change_pct = payload_float(metrics.get("oi_change_pct"))
+        current_notional = payload_float(snapshot.open_interest_notional)
+        if oi_change_pct is None or current_notional is None:
+            continue
+        delta_notional = _estimate_oi_delta_notional(current_notional, oi_change_pct)
+        if abs(float(oi_change_pct)) < 0.05:
+            direction = "持平"
+        else:
+            direction = "增加" if float(oi_change_pct) > 0 else "减少"
+        current_label = f"${fmt_compact(current_notional)}"
+        delta_label = f"${fmt_signed_compact(delta_notional)}" if delta_notional is not None else "-"
+        lines.append(
+            f"{exchange_name} {base_coin} OI {direction} {float(oi_change_pct):+.1f}% | {current_label}（变化 {delta_label}）"
+        )
+    return lines
+
+
+def build_liquidation_brief_lines(
+    base_coin: str,
+    liquidation_metrics_by_exchange: Dict[str, Dict[str, float | int | str | None]],
+    *,
+    exchange_keys: List[str],
+) -> List[str]:
+    lines: List[str] = []
+    for exchange_key in exchange_keys:
+        exchange_name = EXCHANGE_TITLES.get(exchange_key, exchange_key.title())
+        metrics = liquidation_metrics_by_exchange.get(exchange_name) or {}
+        total_notional = payload_float(metrics.get("notional"))
+        long_notional = payload_float(metrics.get("long_notional")) or 0.0
+        short_notional = payload_float(metrics.get("short_notional")) or 0.0
+        if total_notional is None or total_notional <= 0:
+            continue
+        if long_notional > short_notional:
+            dominant_label = "多头爆仓更重"
+        elif short_notional > long_notional:
+            dominant_label = "空头爆仓更重"
+        else:
+            dominant_label = "多空爆仓均衡"
+        lines.append(
+            f"{exchange_name} {base_coin} 爆仓主导 {dominant_label} | 总额 ${fmt_compact(total_notional)}（多头 ${fmt_compact(long_notional)} / 空头 ${fmt_compact(short_notional)}）"
+        )
+    return lines
+
+
+def build_trade_impulse_brief_lines(
+    base_coin: str,
+    trade_metrics_by_exchange: Dict[str, Dict[str, float | int | str | None]],
+    *,
+    exchange_keys: List[str],
+    window_minutes: int,
+) -> List[str]:
+    lines: List[str] = []
+    for exchange_key in exchange_keys:
+        exchange_name = EXCHANGE_TITLES.get(exchange_key, exchange_key.title())
+        metrics = trade_metrics_by_exchange.get(exchange_name) or {}
+        price_change_pct = payload_float(metrics.get("price_change_pct"))
+        delta_notional = payload_float(metrics.get("delta_notional"))
+        regime = str(metrics.get("regime") or "").strip()
+        if price_change_pct is None and delta_notional is None:
+            continue
+        if price_change_pct is not None and price_change_pct >= 0.25:
+            lines.append(
+                f"{exchange_name} {base_coin} 上涨异动 {price_change_pct:+.2f}% | {window_minutes}m 主动差额 ${fmt_signed_compact(delta_notional)} · {regime or '多头推进'}"
+            )
+        elif price_change_pct is not None and price_change_pct <= -0.25:
+            lines.append(
+                f"{exchange_name} {base_coin} 砸盘异动 {price_change_pct:+.2f}% | {window_minutes}m 主动差额 ${fmt_signed_compact(delta_notional)} · {regime or '空头推进'}"
+            )
+        elif delta_notional is not None and abs(delta_notional) >= 1_000_000.0:
+            lines.append(
+                f"{exchange_name} {base_coin} {'买盘' if float(delta_notional) > 0 else '卖盘'}异动 | {window_minutes}m 主动差额 ${fmt_signed_compact(delta_notional)} · {regime or '流量放大'}"
+            )
+    return lines
+
+
+def build_large_trade_brief_lines(large_trade_frame: pd.DataFrame, *, limit: int = 3) -> List[str]:
+    if large_trade_frame.empty:
+        return []
+    frame = large_trade_frame.copy()
+    if "名义金额" in frame.columns:
+        frame = frame.sort_values(["名义金额", "时间"], ascending=[False, False], na_position="last")
+    lines: List[str] = []
+    for _, row in frame.head(limit).iterrows():
+        exchange_name = str(row.get("交易所") or "未知交易所")
+        direction = str(row.get("方向") or "大单")
+        notional = payload_float(row.get("名义金额"))
+        price = payload_float(row.get("价格"))
+        if notional is None or notional <= 0:
+            continue
+        lines.append(
+            f"{exchange_name} 大单 {direction} ${fmt_compact(notional)} @ {fmt_price(price)}"
+        )
+    return lines
+
+
+def build_alert_brief_lines(
+    confirmed_alert_frame: pd.DataFrame,
+    *,
+    exchange_keys: List[str],
+    limit: int = 3,
+) -> List[str]:
+    if confirmed_alert_frame.empty or "告警" not in confirmed_alert_frame.columns:
+        return []
+    allowed_names = {EXCHANGE_TITLES.get(key, key.title()) for key in exchange_keys}
+    frame = confirmed_alert_frame.copy()
+    if "交易所" in frame.columns:
+        frame = frame[frame["交易所"].astype(str).isin(allowed_names)]
+    if "状态" in frame.columns:
+        frame = frame[frame["状态"].astype(str) == "已确认"]
+    if frame.empty:
+        return []
+    priority_map = {"强": 0, "中": 1, "弱": 2}
+    if "等级" in frame.columns:
+        frame = frame.assign(_priority=frame["等级"].map(priority_map).fillna(9))
+        frame = frame.sort_values(["_priority", "交易所", "告警"], na_position="last")
+    lines: List[str] = []
+    for _, row in frame.head(limit).iterrows():
+        exchange_name = str(row.get("交易所") or "未知交易所")
+        alert_title = str(row.get("告警") or "告警")
+        alert_level = str(row.get("等级") or "弱")
+        lines.append(f"{exchange_name} 告警 {alert_title}（{alert_level}）")
+    return lines
+
+
+def build_home_headline_items(
+    base_coin: str,
+    snapshot_by_key: Dict[str, ExchangeSnapshot],
+    oi_metrics_by_exchange: Dict[str, Dict[str, float | str | None]],
+    liquidation_metrics_by_exchange: Dict[str, Dict[str, float | int | str | None]],
+    trade_metrics_by_exchange: Dict[str, Dict[str, float | int | str | None]],
+    *,
+    exchange_keys: List[str],
+    liquidation_window_minutes: int,
+    large_trade_frame: pd.DataFrame | None = None,
+    confirmed_alert_frame: pd.DataFrame | None = None,
+    limit: int = 12,
+) -> List[str]:
+    items: List[str] = []
+    items.extend(
+        build_oi_brief_lines(
+            base_coin,
+            snapshot_by_key,
+            oi_metrics_by_exchange,
+            exchange_keys=exchange_keys,
+        )
+    )
+    items.extend(
+        build_liquidation_brief_lines(
+            base_coin,
+            liquidation_metrics_by_exchange,
+            exchange_keys=exchange_keys,
+        )
+    )
+    items.extend(
+        build_trade_impulse_brief_lines(
+            base_coin,
+            trade_metrics_by_exchange,
+            exchange_keys=exchange_keys,
+            window_minutes=liquidation_window_minutes,
+        )
+    )
+    if confirmed_alert_frame is not None:
+        items.extend(build_alert_brief_lines(confirmed_alert_frame, exchange_keys=exchange_keys))
+    if large_trade_frame is not None:
+        items.extend(build_large_trade_brief_lines(large_trade_frame))
+    normalized_items: List[str] = []
+    seen = set()
+    for item in items:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        normalized_items.append(text)
+        if len(normalized_items) >= max(limit, 1):
+            break
+    return normalized_items
+
+
+def render_home_headline_marquee(container, items: List[str]) -> None:
+    normalized_items = [str(item).strip() for item in items if str(item).strip()]
+    if not normalized_items:
+        container.empty()
+        return
+    chips_html = "".join(
+        f"<span class='headline-marquee-chip'>{html_escape(item)}</span>"
+        for item in normalized_items
+    )
+    container.markdown(
+        f"""
+        <div class="headline-marquee-shell">
+            <div class="headline-marquee-label">实时摘要</div>
+            <div class="headline-marquee-viewport">
+                <div class="headline-marquee-track">
+                    <div class="headline-marquee-group">{chips_html}</div>
+                    <div class="headline-marquee-group" aria-hidden="true">{chips_html}</div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def crowd_period_for_interval(interval: str) -> str:
@@ -4099,6 +5385,7 @@ if selected_exchange_note:
 def render_terminal() -> None:
     snapshots = service.current_snapshots()
     ok_snapshots = [snapshot for snapshot in snapshots if snapshot.status == "ok"]
+    headline_placeholder = st.empty()
     status_text = " · ".join(status_caption(snapshot) for snapshot in snapshots)
     st.markdown(f"<div class='status-strip'>{status_text}</div>", unsafe_allow_html=True)
     if not ok_snapshots:
@@ -4114,7 +5401,7 @@ def render_terminal() -> None:
         "工作台视图",
         view_options,
         chart_key("active-view", base_coin, selected_exchange, interval),
-        default=pick_option(view_options, ui_preferences.get("active_view"), view_options[0]),
+        default=view_options[0],
     )
     exchange_scope_mode = render_choice_bar(
         "交易所范围",
@@ -4336,6 +5623,57 @@ def render_terminal() -> None:
             overview_frame = pd.DataFrame()
         selected_overview_frame = overview_frame[overview_frame["币种"] == base_coin] if not overview_frame.empty and "币种" in overview_frame.columns else pd.DataFrame()
         selected_overview_row = selected_overview_frame.iloc[0].to_dict() if not selected_overview_frame.empty else {}
+        light_live_trade_events = service.get_trade_history(selected_exchange)
+        light_trade_events = (
+            light_live_trade_events
+            if _use_live_trades(light_live_trade_events)
+            else load_exchange_trades_cached(selected_exchange, selected_symbol, 120, request_timeout)
+        )
+        light_session_liquidations = service.get_liquidation_history(selected_exchange)
+        light_liquidation_events = merge_liquidation_events(
+            load_liquidations_cached(selected_exchange, selected_symbol, liquidation_limit, request_timeout),
+            light_session_liquidations,
+        )
+        light_selected_name = EXCHANGE_TITLES.get(selected_exchange, selected_exchange.title())
+        light_trade_metrics_by_exchange = {
+            light_selected_name: build_trade_metrics(
+                light_trade_events,
+                selected_snapshot.timestamp_ms or int(time.time() * 1000),
+                liquidation_window_minutes,
+            )
+        }
+        light_liquidation_metrics_by_exchange = {
+            light_selected_name: build_liquidation_metrics(
+                light_liquidation_events,
+                selected_snapshot.timestamp_ms or int(time.time() * 1000),
+                liquidation_window_minutes,
+            )
+        }
+        light_oi_metrics_by_exchange = {
+            light_selected_name: {
+                "oi_change_pct": payload_float(selected_overview_row.get("OI 1h(%)")),
+            }
+        }
+        light_large_trade_frame = build_large_trade_frame(
+            {light_selected_name: light_trade_events},
+            min_notional=max(75_000.0, float(selected_snapshot.last_price or 0.0) * 1.5),
+            limit=6,
+        )
+        render_home_headline_marquee(
+            headline_placeholder,
+            build_home_headline_items(
+                base_coin,
+                snapshot_by_key,
+                light_oi_metrics_by_exchange,
+                light_liquidation_metrics_by_exchange,
+                light_trade_metrics_by_exchange,
+                exchange_keys=[selected_exchange],
+                liquidation_window_minutes=liquidation_window_minutes,
+                large_trade_frame=light_large_trade_frame,
+                confirmed_alert_frame=pd.DataFrame(),
+                limit=8,
+            ),
+        )
         render_section("竞品级首页", "轻量模式先看主结论、全市场总览板和异动榜，需要更细的盘口和联动再切去深度页或中心页。")
         conclusion_cards = st.columns(4)
         conclusion_cards[0].metric("当前主结论", str(selected_overview_row.get("主结论") or "信号混合"))
@@ -4908,6 +6246,58 @@ def render_terminal() -> None:
                     "状态": st.column_config.TextColumn(),
                 },
             )
+        if history_sqlite_enabled:
+            alert_history_summary = history_store.describe()
+            alert_now_ms = selected_snapshot.timestamp_ms or int(time.time() * 1000)
+            alert_closure_since_ms = alert_now_ms - max(int(alert_review_window_minutes), 60) * 20 * 60_000
+            alert_closure_payload = get_cached_derived_result(
+                f"alert-closure::{base_coin}",
+                (
+                    int(alert_closure_since_ms),
+                    int(alert_history_summary.get("last_market_ts") or 0),
+                    int(alert_history_summary.get("last_alert_ts") or 0),
+                    int(alert_history_summary.get("last_event_ts") or 0),
+                    int(alert_history_summary.get("last_quality_ts") or 0),
+                    tuple(scope_perp_keys),
+                ),
+                ttl_seconds=max(20, refresh_seconds * 5),
+                builder=lambda: build_history_workbench_payload(
+                    history_store,
+                    coin=base_coin,
+                    exchange_keys=scope_perp_keys,
+                    markets=["perp", "spot"],
+                    event_categories=["all"],
+                    since_ms=alert_closure_since_ms,
+                ),
+            ) or {}
+            alert_closure_frame = build_alert_closure_frame(
+                alert_closure_payload.get("alert_history_frame", pd.DataFrame()),
+                alert_closure_payload.get("market_history_frame", pd.DataFrame()),
+                alert_closure_payload.get("event_history_frame", pd.DataFrame()),
+                alert_closure_payload.get("quality_history_frame", pd.DataFrame()),
+                review_window_minutes=max(int(alert_review_window_minutes), 60),
+                limit=18,
+            )
+            render_section("告警闭环板", "同一张表里回看告警触发时的价格、Funding、OI、事件流和复盘结果，减少‘告警响了但过后说不清’。")
+            if alert_closure_frame.empty:
+                st.info("当前历史样本还不足以形成告警闭环板。")
+            else:
+                st.dataframe(
+                    alert_closure_frame,
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "触发价格": st.column_config.NumberColumn(format="%.2f"),
+                        "触发Funding": st.column_config.NumberColumn(format="%.2f"),
+                        "触发OI": st.column_config.NumberColumn(format="%.2f"),
+                        "5m事件额": st.column_config.NumberColumn(format="%.2f"),
+                        "5m事件数": st.column_config.NumberColumn(format="%d"),
+                        "近价撤补比": st.column_config.NumberColumn(format="%.2f"),
+                        "顺风区间(%)": st.column_config.NumberColumn(format="%.3f"),
+                        "逆风区间(%)": st.column_config.NumberColumn(format="%.3f"),
+                        "窗口收益(%)": st.column_config.NumberColumn(format="%.3f"),
+                    },
+                )
         alert_jump_options = ["不跳转"] + [f"{row['交易所']} | {row['告警']}" for _, row in alert_center_frame.iterrows()]
         alert_jump = st.selectbox("告警跳转到复盘", alert_jump_options, key=chart_key("alert-jump", base_coin, interval))
         if st.button("跳到最近 2 分钟复盘窗口", key=chart_key("alert-jump-button", base_coin, interval)):
@@ -4930,8 +6320,26 @@ def render_terminal() -> None:
             session_liquidations,
         )
         spot_snapshot_map, spot_orderbook_map, spot_trades_map = load_spot_market_maps(service, spot_symbol_map, depth_limit, request_timeout)
+        exchange_health_frame = build_exchange_health_frame(
+            describe_exchange_request_health(),
+            service=service,
+            snapshot_by_key=snapshot_by_key,
+            spot_snapshot_map=spot_snapshot_map,
+            available_perp_keys=available_perp_keys,
+            available_spot_keys=available_spot_keys,
+            catalog_status=coin_catalog_status,
+        )
         render_section("接口调试", "查看原始接口返回，定位网络或符号问题。")
         st.write(f"当前主图交易所: `{selected_snapshot.exchange}` | 合约: `{selected_symbol}`")
+        st.dataframe(
+            exchange_health_frame,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "连续失败": st.column_config.NumberColumn(format="%d"),
+                "冷却剩余(s)": st.column_config.NumberColumn(format="%d"),
+            },
+        )
         spot_debug = " | ".join(
             f"{EXCHANGE_TITLES[key]} Spot 笔数 `{len(spot_trades_map[key])}` / 档位 `{len(spot_orderbook_map[key])}`"
             for key in spot_snapshot_map
@@ -5040,6 +6448,15 @@ def render_terminal() -> None:
         depth_limit,
         request_timeout,
         exchange_keys=load_perp_reference_keys,
+    )
+    exchange_health_frame = build_exchange_health_frame(
+        describe_exchange_request_health(),
+        service=service,
+        snapshot_by_key=snapshot_by_key,
+        spot_snapshot_map=spot_snapshot_map,
+        available_perp_keys=available_perp_keys,
+        available_spot_keys=available_spot_keys,
+        catalog_status=coin_catalog_status,
     )
     home_spot_exchange = "binance" if "binance" in spot_snapshot_map else spot_focus_exchange
     spot_snapshot = spot_snapshot_map[home_spot_exchange]
@@ -5644,6 +7061,35 @@ def render_terminal() -> None:
         _orderbook_quality_confidence_score(perp_quality_history, str(selected_transport_health.get("sync_state") or ""))
     )
     selected_replay_confidence = _confidence_label(min(1.0, len(replay_events) / 36.0 if replay_events else 0.0))
+    spot_perp_decision_frame = build_spot_perp_decision_frame(
+        spot_exchange_frame,
+        lead_lag_frame,
+        contract_sentiment_frame,
+        perp_crowding_trio_frame,
+        funding_regime_frame,
+    )
+    propagation_snapshots = [snapshot_by_key[key] for key in perp_reference_exchange_keys if key in snapshot_by_key and snapshot_by_key[key].status == "ok"]
+    propagation_spread_frame = build_cross_exchange_spread_frame(propagation_snapshots) if propagation_snapshots else pd.DataFrame()
+    propagation_funding_arb_frame = build_funding_arb_frame(propagation_snapshots, limit=10) if propagation_snapshots else pd.DataFrame()
+    unified_signal_frame = build_unified_signal_frame(
+        spot_perp_decision_frame,
+        contract_sentiment_alert_frame,
+        confirmed_alert_frame,
+        share_dynamics_frame,
+        risk_buffer_frame,
+    )
+    execution_route_frame = build_execution_route_frame(
+        spot_execution_frame,
+        perp_execution_frame,
+        spot_perp_decision_frame,
+    )
+    propagation_frame = build_cross_exchange_propagation_frame(
+        spot_perp_decision_frame,
+        share_dynamics_frame,
+        propagation_spread_frame,
+        propagation_funding_arb_frame,
+        cross_exchange_cluster_frame,
+    )
     if history_sqlite_enabled:
         history_store.record_market_events(
             base_coin,
@@ -5714,6 +7160,8 @@ def render_terminal() -> None:
         watchlist_bundles: List[Dict[str, Any]] = []
         watchlist_leaderboard_frame = pd.DataFrame()
         watch_group_frame = pd.DataFrame()
+        watch_behavior_frame = pd.DataFrame()
+        watch_risk_frame = pd.DataFrame()
         liquidation_density_frame = pd.DataFrame()
         vault_watch_frame = pd.DataFrame()
         chain_trade_frame = pd.DataFrame()
@@ -5783,6 +7231,12 @@ def render_terminal() -> None:
             ) or []
             watchlist_leaderboard_frame = build_hyperliquid_watchlist_leaderboard_frame(watchlist_bundles)
             watch_group_frame = build_hyperliquid_watch_group_frame(watchlist_bundles)
+            watch_behavior_frame = build_hyperliquid_watch_behavior_frame(
+                watchlist_bundles,
+                predicted_funding_frame,
+                current_coin=symbol_map["hyperliquid"],
+            )
+            watch_risk_frame = build_hyperliquid_watch_risk_frame(watch_behavior_frame)
             watchlist_positions = build_hyperliquid_watchlist_position_rows(watchlist_bundles)
             liquidation_density_frame = build_liquidation_density_frame(
                 watchlist_positions,
@@ -6090,6 +7544,51 @@ def render_terminal() -> None:
                         vault_watch_frame,
                         width="stretch",
                         hide_index=True,
+                    )
+            behavior_left, behavior_right = st.columns([1.2, 1.0], gap="large")
+            with behavior_left:
+                if watch_behavior_frame.empty:
+                    st.info("当前还没有足够的地址行为样本。")
+                else:
+                    behavior_display_frame = watch_behavior_frame.copy()
+                    if "最新成交时间" in behavior_display_frame.columns:
+                        behavior_display_frame["最新成交时间"] = [
+                            "-" if pd.isna(value) else pd.to_datetime(value).strftime("%m-%d %H:%M:%S")
+                            for value in behavior_display_frame["最新成交时间"]
+                        ]
+                    st.dataframe(
+                        behavior_display_frame,
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "账户权益": st.column_config.NumberColumn(format="%.2f"),
+                            "当前币种持仓值": st.column_config.NumberColumn(format="%.2f"),
+                            "总持仓值": st.column_config.NumberColumn(format="%.2f"),
+                            "Funding净额": st.column_config.NumberColumn(format="%.2f"),
+                            "最新成交额": st.column_config.NumberColumn(format="%.2f"),
+                            "最近Funding": st.column_config.NumberColumn(format="%.2f"),
+                            "预测费率(bps)": st.column_config.NumberColumn(format="%.3f"),
+                            "最近清算距离(%)": st.column_config.NumberColumn(format="%.2f"),
+                        },
+                    )
+            with behavior_right:
+                if watch_risk_frame.empty:
+                    st.info("当前分组下还没有足够的风险聚合样本。")
+                else:
+                    st.dataframe(
+                        watch_risk_frame,
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "地址数": st.column_config.NumberColumn(format="%d"),
+                            "在线率(%)": st.column_config.NumberColumn(format="%.1f"),
+                            "账户权益": st.column_config.NumberColumn(format="%.2f"),
+                            "当前币种持仓值": st.column_config.NumberColumn(format="%.2f"),
+                            "总持仓值": st.column_config.NumberColumn(format="%.2f"),
+                            "Funding净额": st.column_config.NumberColumn(format="%.2f"),
+                            "预测费率(bps)": st.column_config.NumberColumn(format="%.3f"),
+                            "最近清算距离(%)": st.column_config.NumberColumn(format="%.2f"),
+                        },
                     )
             chain_left, chain_right = st.columns([1.25, 1.15], gap="large")
             with chain_left:
@@ -6428,6 +7927,15 @@ def render_terminal() -> None:
                 st.warning("Telegram 推送这轮有失败: " + " | ".join(telegram_errors[:3]))
             if archive_events:
                 st.caption("本轮自动归档: " + " | ".join(f"{item['table']} {item['day']} {item['rows']}行" for item in archive_events[:4]))
+            st.dataframe(
+                exchange_health_frame,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "连续失败": st.column_config.NumberColumn(format="%d"),
+                    "冷却剩余(s)": st.column_config.NumberColumn(format="%d"),
+                },
+            )
             persist_left, persist_right = st.columns([1.0, 1.3], gap="large")
             with persist_left:
                 st.dataframe(
@@ -6522,6 +8030,124 @@ def render_terminal() -> None:
                         data=quality_history_frame.to_csv(index=False).encode("utf-8"),
                         file_name=f"{base_coin.lower()}-quality-history.csv",
                         mime="text/csv",
+                    )
+            if history_sqlite_enabled:
+                history_workbench_window = st.selectbox(
+                    "复盘窗口",
+                    ["1 小时", "4 小时", "12 小时", "24 小时", "72 小时"],
+                    index=1,
+                    key=chart_key("history-workbench-window", base_coin, lab_mode),
+                )
+                history_workbench_market = st.selectbox(
+                    "复盘市场",
+                    ["合约", "现货", "合并"],
+                    index=0,
+                    key=chart_key("history-workbench-market", base_coin, lab_mode),
+                )
+                history_workbench_event = st.selectbox(
+                    "事件类型",
+                    ["全部事件", "成交", "爆仓"],
+                    index=0,
+                    key=chart_key("history-workbench-event", base_coin, lab_mode),
+                )
+                history_exchange_options = [EXCHANGE_TITLES[key] for key in EXCHANGE_ORDER]
+                default_history_exchange_titles = [EXCHANGE_TITLES[key] for key in scope_perp_keys] if scope_perp_keys else [EXCHANGE_TITLES[selected_exchange]]
+                selected_history_exchange_titles = st.multiselect(
+                    "复盘交易所",
+                    history_exchange_options,
+                    default=default_history_exchange_titles,
+                    key=chart_key("history-workbench-exchanges", base_coin, lab_mode),
+                )
+                history_exchange_map = {value: key for key, value in EXCHANGE_TITLES.items()}
+                history_workbench_exchange_keys = [history_exchange_map[title] for title in selected_history_exchange_titles if title in history_exchange_map]
+                history_window_ms_map = {
+                    "1 小时": 1 * 60 * 60 * 1000,
+                    "4 小时": 4 * 60 * 60 * 1000,
+                    "12 小时": 12 * 60 * 60 * 1000,
+                    "24 小时": 24 * 60 * 60 * 1000,
+                    "72 小时": 72 * 60 * 60 * 1000,
+                }
+                history_market_selection = {
+                    "合约": ["perp"],
+                    "现货": ["spot"],
+                    "合并": ["perp", "spot"],
+                }.get(history_workbench_market, ["perp"])
+                history_event_selection = {
+                    "全部事件": ["all"],
+                    "成交": ["trade"],
+                    "爆仓": ["liquidation"],
+                }.get(history_workbench_event, ["all"])
+                history_workbench_since_ms = now_ms - history_window_ms_map.get(history_workbench_window, 4 * 60 * 60 * 1000)
+                history_workbench_payload = get_cached_derived_result(
+                    f"history-workbench::{base_coin}",
+                    (
+                        int(history_workbench_since_ms),
+                        tuple(history_workbench_exchange_keys),
+                        tuple(history_market_selection),
+                        tuple(history_event_selection),
+                        int(history_summary.get("last_market_ts") or 0),
+                        int(history_summary.get("last_event_ts") or 0),
+                        int(history_summary.get("last_quality_ts") or 0),
+                        int(history_summary.get("last_alert_ts") or 0),
+                    ),
+                    ttl_seconds=max(20, refresh_seconds * 5),
+                    builder=lambda: build_history_workbench_payload(
+                        history_store,
+                        coin=base_coin,
+                        exchange_keys=history_workbench_exchange_keys,
+                        markets=history_market_selection,
+                        event_categories=history_event_selection,
+                        since_ms=history_workbench_since_ms,
+                    ),
+                ) or {}
+                history_workbench_market_frame = history_workbench_payload.get("market_history_frame", pd.DataFrame())
+                history_workbench_event_frame = history_workbench_payload.get("event_history_frame", pd.DataFrame())
+                history_workbench_quality_frame = history_workbench_payload.get("quality_history_frame", pd.DataFrame())
+                history_workbench_alert_frame = history_workbench_payload.get("alert_history_frame", pd.DataFrame())
+                render_section("历史复盘工作台", "按窗口、市场、事件类型和交易所切片，直接回看价格、OI、Funding、事件流和盘口质量，不用手工翻 SQLite。")
+                workbench_cards = st.columns(4)
+                workbench_cards[0].metric("市场样本", str(len(history_workbench_market_frame)))
+                workbench_cards[1].metric("事件样本", str(len(history_workbench_event_frame)))
+                workbench_cards[2].metric("盘口质量点", str(len(history_workbench_quality_frame)))
+                workbench_cards[3].metric("告警样本", str(len(history_workbench_alert_frame)))
+                workbench_left, workbench_right = st.columns([1.4, 1.0], gap="large")
+                with workbench_left:
+                    st.plotly_chart(
+                        build_history_workbench_figure(history_workbench_market_frame),
+                        key=chart_key("history-workbench-market-figure", base_coin, lab_mode),
+                        config=PLOTLY_CONFIG,
+                    )
+                with workbench_right:
+                    st.plotly_chart(
+                        build_history_event_mix_figure(history_workbench_event_frame),
+                        key=chart_key("history-workbench-event-figure", base_coin, lab_mode),
+                        config=PLOTLY_CONFIG,
+                    )
+                workbench_detail_left, workbench_detail_right = st.columns([1.0, 1.0], gap="large")
+                with workbench_detail_left:
+                    st.dataframe(
+                        history_workbench_event_frame.head(40),
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "价格": st.column_config.NumberColumn(format="%.4f"),
+                            "数量": st.column_config.NumberColumn(format="%.4f"),
+                            "名义金额": st.column_config.NumberColumn(format="%.2f"),
+                        },
+                    )
+                with workbench_detail_right:
+                    st.dataframe(
+                        history_workbench_quality_frame.head(40),
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "新增挂单额": st.column_config.NumberColumn(format="%.2f"),
+                            "撤单额": st.column_config.NumberColumn(format="%.2f"),
+                            "净变化": st.column_config.NumberColumn(format="%.2f"),
+                            "近价新增": st.column_config.NumberColumn(format="%.2f"),
+                            "近价撤单": st.column_config.NumberColumn(format="%.2f"),
+                            "盘口失衡(%)": st.column_config.NumberColumn(format="%.2f"),
+                        },
                     )
             index_left, index_right = st.columns([1.0, 1.2], gap="large")
             with index_left:
@@ -7400,6 +9026,27 @@ def render_terminal() -> None:
             st.caption(f"当前速度 {replay_speed}，窗口总长约 {replay_window_seconds:.0f}s，按当前进度相当于回放到 {virtual_seconds:.1f}s。这里先做交互式时间游标回放，方便你快速定位某次爆仓前后 2 分钟。")
 
     if active_view == "首页总览" and overview_mode == "完整":
+        headline_exchange_keys = scope_perp_keys if exchange_scope_mode == "当前交易所优先" else list(EXCHANGE_ORDER)
+        headline_large_trade_frame = build_large_trade_frame(
+            {EXCHANGE_TITLES[key]: trade_events_by_exchange.get(key, []) for key in headline_exchange_keys},
+            min_notional=max(75_000.0, float(selected_snapshot.last_price or 0.0) * 1.5),
+            limit=10,
+        )
+        render_home_headline_marquee(
+            headline_placeholder,
+            build_home_headline_items(
+                base_coin,
+                snapshot_by_key,
+                oi_metrics_by_exchange,
+                liquidation_metrics_by_exchange,
+                trade_metrics_by_exchange,
+                exchange_keys=headline_exchange_keys,
+                liquidation_window_minutes=liquidation_window_minutes,
+                large_trade_frame=headline_large_trade_frame,
+                confirmed_alert_frame=confirmed_alert_frame,
+                limit=12,
+            ),
+        )
         render_section("竞品级首页", "先看主结论、全市场总览板和异动榜，再决定要不要切到单币深度页。")
         conclusion_cards = st.columns(4)
         conclusion_cards[0].metric("当前主结论", str(composite_signal.get("label") or "-"))
@@ -7408,6 +9055,49 @@ def render_terminal() -> None:
         conclusion_cards[3].metric("爆仓主导", str(selected_liquidation_truth.get("dominant") or "暂无"))
         for line in home_conclusions:
             st.markdown(f"- {line}")
+
+        render_section("交易所健康 / 自动熔断", "把目录状态、REST 受限、WS 在线情况和自动冷却都集中放在这一层，云端部署时更容易看出到底是哪一段在降级。")
+        health_cards = st.columns(4)
+        health_cards[0].metric("目录受限所数", str(int(exchange_health_frame["目录"].astype(str).str.contains("目录受限", na=False).sum()) if not exchange_health_frame.empty else 0))
+        health_cards[1].metric("REST 冷却所数", str(int((pd.to_numeric(exchange_health_frame["冷却剩余(s)"], errors="coerce").fillna(0) > 0).sum()) if not exchange_health_frame.empty else 0))
+        health_cards[2].metric("WS 待修复", str(int(exchange_health_frame["说明"].astype(str).str.contains("WS待修复", na=False).sum()) if not exchange_health_frame.empty else 0))
+        health_cards[3].metric("最近成功", exchange_health_frame["最近成功"].iloc[0] if not exchange_health_frame.empty else "-")
+        st.dataframe(
+            exchange_health_frame,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "连续失败": st.column_config.NumberColumn(format="%d"),
+                "冷却剩余(s)": st.column_config.NumberColumn(format="%d"),
+            },
+        )
+
+        render_section("统一评分层", "把现货/合约决策、情绪告警、份额变化和风险缓冲汇成一张总控板，先给一个主判断，再展开看原因。")
+        score_cards = st.columns(4)
+        score_cards[0].metric("最高评分", f"{float(unified_signal_frame.iloc[0]['统一评分']):.1f}" if not unified_signal_frame.empty else "-")
+        score_cards[1].metric("最强方向", str(unified_signal_frame.iloc[0]["方向"]) if not unified_signal_frame.empty else "-")
+        score_cards[2].metric("优先执行", str(unified_signal_frame.iloc[0]["执行偏好"]) if not unified_signal_frame.empty else "-")
+        score_cards[3].metric("高分样本", str(int((pd.to_numeric(unified_signal_frame["统一评分"], errors='coerce').fillna(0.0) >= 70.0).sum()) if not unified_signal_frame.empty else 0))
+        score_left, score_right = st.columns([1.0, 1.2], gap="large")
+        with score_left:
+            st.plotly_chart(
+                build_unified_signal_figure(unified_signal_frame),
+                key=chart_key("unified-signal-score", base_coin, interval, exchange_scope_mode),
+                config=PLOTLY_CONFIG,
+            )
+        with score_right:
+            st.dataframe(
+                unified_signal_frame,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "统一评分": st.column_config.NumberColumn(format="%.1f"),
+                    "OI份额Δ(%)": st.column_config.NumberColumn(format="%.2f"),
+                    "合约成交份额Δ(%)": st.column_config.NumberColumn(format="%.2f"),
+                    "现货成交份额Δ(%)": st.column_config.NumberColumn(format="%.2f"),
+                    "风险比": st.column_config.NumberColumn(format="%.2f"),
+                },
+            )
 
         render_section("全市场总览板", "按币种把价格、OI、OI 1h/24h、Funding、爆仓样本、多空比、现货/合约成交比和 Lead/Lag 放在一张榜单里。")
         if overview_frame.empty:
@@ -7513,6 +9203,14 @@ def render_terminal() -> None:
                             "份额(%)": st.column_config.ProgressColumn(format="%.2f", min_value=0.0, max_value=100.0),
                         },
                     )
+            oi_brief_lines = build_oi_brief_lines(
+                base_coin,
+                snapshot_by_key,
+                oi_metrics_by_exchange,
+                exchange_keys=scope_perp_keys if exchange_scope_mode == "当前交易所优先" else list(EXCHANGE_ORDER),
+            )
+            if oi_brief_lines:
+                st.caption("OI 快报: " + " · ".join(oi_brief_lines))
 
         if market_board_mode == "现货看板":
             render_section(
@@ -8173,6 +9871,96 @@ def render_terminal() -> None:
                             "近价撤补比": st.column_config.NumberColumn(format="%.2f"),
                         },
                     )
+
+        render_section("现货先动 / 合约追价 决策板", "把现货主动流、Lead/Lag、合约主动流、多空比、OI 和 Funding 汇成一张判断板，先看谁在主导，再决定要不要追。")
+        decision_cards = st.columns(4)
+        decision_cards[0].metric("高置信判断", str(int(spot_perp_decision_frame["置信度"].astype(str).eq("高置信").sum()) if not spot_perp_decision_frame.empty else 0))
+        decision_cards[1].metric("现货先动", str(int(spot_perp_decision_frame["主导判断"].astype(str).eq("现货先动").sum()) if not spot_perp_decision_frame.empty else 0))
+        decision_cards[2].metric("合约追价/抢跑", str(int(spot_perp_decision_frame["主导判断"].astype(str).isin(["合约追价", "合约抢跑"]).sum()) if not spot_perp_decision_frame.empty else 0))
+        decision_cards[3].metric(
+            "最清晰样本",
+            str(spot_perp_decision_frame.iloc[0]["交易所"]) if not spot_perp_decision_frame.empty else "-",
+            str(spot_perp_decision_frame.iloc[0]["主导判断"]) if not spot_perp_decision_frame.empty else "-",
+        )
+        if spot_perp_decision_frame.empty:
+            st.info("当前样本还不足以形成稳定的现货 / 合约决策板。")
+        else:
+            st.dataframe(
+                spot_perp_decision_frame,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "领先秒数": st.column_config.NumberColumn(format="%.2f"),
+                    "相关性": st.column_config.NumberColumn(format="%.2f"),
+                    "现货主动买占比(%)": st.column_config.NumberColumn(format="%.2f"),
+                    "合约主动买占比(%)": st.column_config.NumberColumn(format="%.2f"),
+                    "合约多空比": st.column_config.NumberColumn(format="%.3f"),
+                    "OI变化(%)": st.column_config.NumberColumn(format="%.2f"),
+                    "Funding(bps)": st.column_config.NumberColumn(format="%.2f"),
+                    "Basis(%)": st.column_config.NumberColumn(format="%.3f"),
+                    "永续/现货成交额比": st.column_config.NumberColumn(format="%.2f"),
+                },
+            )
+            st.caption("这块是决策参考层，不是交易建议。它更适合帮你先分清：现在是现货先动、合约跟价，还是合约自己在抢跑。")
+
+        render_section("执行层 / 路由矩阵", "把现货和合约放到同一张执行表里，直接比较去哪一所、走哪个市场更省滑点。")
+        execution_cards = st.columns(4)
+        execution_cards[0].metric("最佳路由", str(execution_route_frame.iloc[0]["路由"]) if not execution_route_frame.empty else "-")
+        execution_cards[1].metric("最高执行评分", f"{float(execution_route_frame.iloc[0]['执行评分']):.1f}" if not execution_route_frame.empty else "-")
+        execution_cards[2].metric("优先现货", str(int(execution_route_frame["执行建议"].astype(str).eq("优先现货").sum()) if not execution_route_frame.empty else 0))
+        execution_cards[3].metric("优先合约", str(int(execution_route_frame["执行建议"].astype(str).eq("优先合约").sum()) if not execution_route_frame.empty else 0))
+        execution_left, execution_right = st.columns([1.0, 1.2], gap="large")
+        with execution_left:
+            execution_figure_frame = execution_route_frame.copy()
+            if not execution_figure_frame.empty and "路由" in execution_figure_frame.columns:
+                execution_figure_frame["交易所"] = execution_figure_frame["路由"]
+            st.plotly_chart(
+                build_execution_quality_figure(execution_figure_frame, title="Execution Route Matrix"),
+                key=chart_key("execution-route-matrix", base_coin, interval, exchange_scope_mode),
+                config=PLOTLY_CONFIG,
+            )
+        with execution_right:
+            st.dataframe(
+                execution_route_frame,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "执行评分": st.column_config.NumberColumn(format="%.1f"),
+                    "价差(bps)": st.column_config.NumberColumn(format="%.2f"),
+                    "50k冲击(bps)": st.column_config.NumberColumn(format="%.2f"),
+                    "250k冲击(bps)": st.column_config.NumberColumn(format="%.2f"),
+                    "50k填充率(%)": st.column_config.NumberColumn(format="%.1f"),
+                    "250k填充率(%)": st.column_config.NumberColumn(format="%.1f"),
+                    "可见深度": st.column_config.NumberColumn(format="%.2f"),
+                },
+            )
+
+        render_section("跨所传导路径板", "不只看谁先动，还看份额、价差和爆仓簇怎么在交易所之间扩散。")
+        propagation_cards = st.columns(4)
+        propagation_cards[0].metric("主导路径", str(propagation_frame.iloc[0]["交易所"]) if not propagation_frame.empty else "-")
+        propagation_cards[1].metric("主导角色", str(propagation_frame.iloc[0]["角色"]) if not propagation_frame.empty else "-")
+        propagation_cards[2].metric("最高传导评分", f"{float(propagation_frame.iloc[0]['传导评分']):.1f}" if not propagation_frame.empty else "-")
+        propagation_cards[3].metric("爆仓传导所数", str(int(propagation_frame['角色'].astype(str).eq('爆仓传导').sum()) if not propagation_frame.empty else 0))
+        propagation_left, propagation_right = st.columns([1.0, 1.2], gap="large")
+        with propagation_left:
+            st.plotly_chart(
+                build_cross_exchange_propagation_figure(propagation_frame),
+                key=chart_key("cross-exchange-propagation", base_coin, interval, exchange_scope_mode),
+                config=PLOTLY_CONFIG,
+            )
+        with propagation_right:
+            st.dataframe(
+                propagation_frame,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "传导评分": st.column_config.NumberColumn(format="%.1f"),
+                    "现货份额Δ(%)": st.column_config.NumberColumn(format="%.2f"),
+                    "合约份额Δ(%)": st.column_config.NumberColumn(format="%.2f"),
+                    "OI份额Δ(%)": st.column_config.NumberColumn(format="%.2f"),
+                    "价差偏离(bps)": st.column_config.NumberColumn(format="%.2f"),
+                },
+            )
 
         perp_reference_price = payload_float(
             pd.Series(
