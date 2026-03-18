@@ -1,5 +1,15 @@
 # Liquid Glass Flow Desk
 
+<img width="1870" height="931" alt="image" src="https://github.com/user-attachments/assets/ef3330e6-b231-4fed-9bf5-3c21dba37ef5" />
+ <img width="1311" height="843" alt="image" src="https://github.com/user-attachments/assets/9969e1c9-20bb-4ef2-837e-f0eeefc51152" />
+<img width="1330" height="848" alt="image" src="https://github.com/user-attachments/assets/00c6ca89-2402-4bd0-8fbd-313f0c90bffd" />
+<img width="1524" height="902" alt="image" src="https://github.com/user-attachments/assets/59207db6-102f-402e-bf3d-e24096444176" />
+<img width="1524" height="874" alt="image" src="https://github.com/user-attachments/assets/6abcf4df-4c80-492b-bc4e-ef74f7ffb26f" />
+<img width="1380" height="854" alt="image" src="https://github.com/user-attachments/assets/9c8534c2-6f47-435e-b685-18b4e1e3b02e" />
+<img width="1423" height="868" alt="image" src="https://github.com/user-attachments/assets/01ccd9fd-ef5d-4ab9-8027-3ed59a7eafe9" />
+
+<img width="1463" height="888" alt="image" src="https://github.com/user-attachments/assets/91c51f1a-7d76-4644-85cf-4c4ede4ee18b" />
+
 多交易所现货 / 合约流动性终端，基于 Streamlit 构建，聚合 Binance、Bybit、OKX、Hyperliquid 的公开市场数据，并在同一界面里提供盘口、成交、OI、Funding、爆仓、地址模式、历史归档和告警复盘能力。
 
 这个项目的目标不是做“单一图表页”，而是做一套更接近交易台的本地工作台：
